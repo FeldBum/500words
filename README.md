@@ -23,6 +23,12 @@ browser to switch off its own writing suggestions. Every word is the writer's ow
   Imported words never count toward the daily 500.
 - Password reset by email (optional email on accounts), sent through Resend.
 
+- Writing supports **bold** and _italic_ (stored as `**…**` / `_…_`, with `\ * _` escaped).
+  Paste and drop come in as plain text.
+- Manuscript view: toggles for scene titles and breaks between scenes; export to Word (.docx),
+  "Copy for Google Docs" (formatted clipboard + docs.new), .txt and .md.
+- Share one story by a private read-only link (`/s/<token>`): on/off, new link, titles/breaks options.
+
 ## Stack
 Bun + Postgres (Bun's built-in SQL client), vanilla JS front end, no third-party scripts.
 Deployed on Railway from this repo (Dockerfile). Variables: `DATABASE_URL`, `APP_URL`

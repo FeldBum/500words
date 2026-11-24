@@ -1,6 +1,7 @@
 import mammoth from "mammoth";
 import { countWords } from "./words";
 import { TYPES, containerTitle, type ProjectType } from "./types";
+import { escapeText, fromMarkdown, toPlain } from "./format";
 
 // Imports bring in the writer's own existing work (Word, Google Docs, plain
 // text). Nothing here generates or alters text beyond splitting it into
@@ -9,14 +10,13 @@ import { TYPES, containerTitle, type ProjectType } from "./types";
 export type Block = { t: "title" | "h1" | "h2" | "h3" | "p" | "break"; text: string };
 
 const BREAK_RE = /^\s*(?:(?:\*\s*){3,}|(?:#\s*){1,3}|(?:-\s*){3,}|(?:~\s*){3,}|(?:•\s*){3,}|(?:_\s*){3,}|§)\s*$/;
+export const SCENE_BREAK = "\\* \\* \\*"; // "* * *" in stored format
 const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
 
 export class ImportError extends Error {}
 
-function decode(s: string) {
+function entities(s: string) {
   return s
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
     .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -24,14 +24,39 @@ function decode(s: string) {
     .replace(/&#39;|&#x27;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
-    .replace(/&amp;/g, "&")
-    .replace(/[ \t ]+\n/g, "\n")
-    .trim();
+    .replace(/&amp;/g, "&");
 }
 
+// HTML from mammoth → our stored format, keeping bold and italics.
+function decode(html: string): string {
+  let out = "";
+  let b = 0, i = 0;
+  const re = /<(\/?)([a-z0-9]+)[^>]*>|([^<]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    if (m[3] !== undefined) { out += escapeText(entities(m[3])); continue; }
+    const close = m[1] === "/";
+    const tag = m[2].toLowerCase();
+    if (tag === "br") out += "\n";
+    else if (tag === "strong" || tag === "b") {
+      if (!close && b++ === 0) out += "**";
+      else if (close && b > 0 && --b === 0) out += "**";
+    } else if (tag === "em" || tag === "i") {
+      if (!close && i++ === 0) out += "_";
+      else if (close && i > 0 && --i === 0) out += "_";
+    }
+  }
+  if (b > 0) out += "**";
+  if (i > 0) out += "_";
+  // Drop empty marks, then trailing spaces before line breaks.
+  return out.replace(/(?<!\\)\*\*\*\*/g, "").replace(/(?<!\\)__/g, "").replace(/[ \t ]+\n/g, "\n").trim();
+}
+
+// text is in stored format (escaped, with marks).
 function pushPara(blocks: Block[], text: string) {
-  if (!text.trim()) return;
-  if (BREAK_RE.test(text)) blocks.push({ t: "break", text: "" });
+  const plain = toPlain(text);
+  if (!plain.trim()) return;
+  if (BREAK_RE.test(plain)) blocks.push({ t: "break", text: "" });
   else blocks.push({ t: "p", text });
 }
 
@@ -62,15 +87,16 @@ export async function parseDocx(buf: Buffer): Promise<{ blocks: Block[]; title: 
   while ((m = re.exec(html))) {
     const tag = m[1].toLowerCase();
     const text = decode(m[2]);
+    const plainText = toPlain(text).trim();
     if (tag === "h6" && /doctitle/.test(m[0].slice(0, 40))) {
-      if (!title && text) title = text;
+      if (!title && plainText) title = plainText;
       else pushPara(blocks, text);
       continue;
     }
     if (/^h[1-5]$/.test(tag)) {
-      if (!text) continue;
+      if (!plainText) continue;
       const level = Math.min(3, Number(tag[1]));
-      blocks.push({ t: (`h${level}` as Block["t"]), text });
+      blocks.push({ t: (`h${level}` as Block["t"]), text: plainText });
     } else {
       pushPara(blocks, tag === "li" ? "• " + text : text);
     }
@@ -80,6 +106,7 @@ export async function parseDocx(buf: Buffer): Promise<{ blocks: Block[]; title: 
 
 export function parseText(text: string, markdown: boolean): { blocks: Block[]; title: string | null } {
   const blocks: Block[] = [];
+  const fmt = (t: string) => (markdown ? fromMarkdown(t) : escapeText(t));
   const paras = text.replace(/\r\n?/g, "\n").split(/\n\s*\n/);
   for (const raw of paras) {
     const para = raw.replace(/\s+$/g, "");
@@ -90,13 +117,13 @@ export function parseText(text: string, markdown: boolean): { blocks: Block[]; t
       for (const line of lines) {
         const h = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
         if (h) {
-          if (buf.length) { pushPara(blocks, buf.join("\n")); buf = []; }
-          blocks.push({ t: (`h${Math.min(3, h[1].length)}` as Block["t"]), text: h[2] });
+          if (buf.length) { pushPara(blocks, fmt(buf.join("\n"))); buf = []; }
+          blocks.push({ t: (`h${Math.min(3, h[1].length)}` as Block["t"]), text: toPlain(fromMarkdown(h[2])) });
         } else buf.push(line);
       }
-      if (buf.length) pushPara(blocks, buf.join("\n"));
+      if (buf.length) pushPara(blocks, fmt(buf.join("\n")));
     } else {
-      pushPara(blocks, para);
+      pushPara(blocks, fmt(para));
     }
   }
   return { blocks, title: null };
@@ -159,7 +186,7 @@ export function planImport(type: ProjectType, blocks: Block[]): Plan {
   if (def.single) {
     const parts: string[] = [];
     for (const b of blocks) {
-      if (b.t === "break") parts.push("* * *");
+      if (b.t === "break") parts.push(SCENE_BREAK);
       else if (b.t === "title") continue;
       else parts.push(b.text);
     }

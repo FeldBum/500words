@@ -18,6 +18,93 @@
   const WORD = /[\p{L}\p{N}][\p{L}\p{N}\p{M}'’\-]*/gu;
   const countWords = (t) => (t ? (t.match(WORD) || []).length : 0);
 
+  // ---------- stored text format (must match src/format.ts) ----------
+  // Lines of text with **bold** and _italic_; \ * _ escaped with a backslash.
+  const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const escapeText = (s) => s.replace(/[\\*_]/g, (c) => "\\" + c);
+  const BREAK_LINE = /^\s*(?:(?:\*\s*){3,}|(?:#\s*){1,3}|(?:-\s*){3,}|(?:~\s*){3,}|(?:•\s*){3,}|§)\s*$/;
+  function parseBody(body) {
+    const lines = [];
+    let b = false, i = false;
+    for (const line of body.split("\n")) {
+      const runs = [];
+      let buf = "";
+      const flush = () => { if (buf) { runs.push({ text: buf, b, i }); buf = ""; } };
+      for (let k = 0; k < line.length; k++) {
+        const c = line[k];
+        if (c === "\\" && k + 1 < line.length && "\\*_".includes(line[k + 1])) { buf += line[++k]; continue; }
+        if (c === "*" && line[k + 1] === "*") { flush(); b = !b; k++; continue; }
+        if (c === "_") { flush(); i = !i; continue; }
+        buf += c;
+      }
+      flush();
+      lines.push(runs);
+    }
+    return lines;
+  }
+  const toPlain = (body) => parseBody(body).map((r) => r.map((x) => x.text).join("")).join("\n");
+  const runsToHtml = (runs) => runs.map((r) => {
+    let t = escHtml(r.text);
+    if (r.i) t = `<i>${t}</i>`;
+    if (r.b) t = `<b>${t}</b>`;
+    return t;
+  }).join("");
+  function storedToHtml(stored) {
+    if (!stored) return "";
+    return parseBody(stored).map((runs) => `<div>${runsToHtml(runs) || "<br>"}</div>`).join("");
+  }
+  function runsToStored(runs) {
+    return runs.map((r) => {
+      const m = r.text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+      if (!m[2] || (!r.b && !r.i)) return escapeText(r.text);
+      let t = escapeText(m[2]);
+      if (r.i) t = `_${t}_`;
+      if (r.b) t = `**${t}**`;
+      return m[1] + t + m[3];
+    }).join("");
+  }
+  // The editor's DOM (divs, <br>, <b>/<i> and friends) → stored text.
+  function serializeEditor(root) {
+    const lines = [];
+    let cur = [];
+    const emit = (text, b, i) => {
+      if (!text) return;
+      const last = cur[cur.length - 1];
+      if (last && last.b === b && last.i === i) last.text += text;
+      else cur.push({ text, b, i });
+    };
+    const newline = () => { lines.push(cur); cur = []; };
+    const BLOCK = /^(DIV|P|LI|H[1-6]|BLOCKQUOTE|PRE|SECTION|ARTICLE|UL|OL)$/;
+    const bold = (el) => el.tagName === "B" || el.tagName === "STRONG" || el.style.fontWeight === "bold" || Number(el.style.fontWeight) >= 600;
+    const ital = (el) => el.tagName === "I" || el.tagName === "EM" || el.style.fontStyle === "italic";
+    const hasFollowing = (n) => { for (let s = n.nextSibling; s; s = s.nextSibling) if (s.nodeType === 1 || (s.nodeType === 3 && s.data !== "")) return true; return false; };
+    function walk(node, b, i) {
+      for (const ch of node.childNodes) {
+        if (ch.nodeType === 3) {
+          const parts = ch.data.replace(/ /g, " ").split("\n");
+          parts.forEach((p, k) => { if (k > 0) newline(); emit(p, b, i); });
+        } else if (ch.nodeType === 1) {
+          if (ch.tagName === "BR") {
+            // A <br> that ends its block is just a placeholder for the line.
+            if (hasFollowing(ch) || node === root) newline();
+          } else if (BLOCK.test(ch.tagName)) {
+            if (cur.length) newline();
+            const before = lines.length;
+            walk(ch, b || bold(ch), i || ital(ch));
+            if (cur.length || lines.length === before) newline();
+          } else {
+            walk(ch, b || bold(ch), i || ital(ch));
+          }
+        }
+      }
+    }
+    walk(root, false, false);
+    if (cur.length) newline();
+    // Trailing <br> at the root's very end leaves an extra empty line.
+    while (lines.length && !lines[lines.length - 1].length && root.lastChild && root.lastChild.nodeName === "BR") { lines.pop(); break; }
+    return lines.map(runsToStored).join("\n").replace(/\n+$/, "");
+  }
+
   const state = { me: null, todayWords: 0, focus: false };
   const app = document.getElementById("app");
   let cleanup = []; // functions to run when leaving a view
@@ -219,6 +306,7 @@
     document.querySelectorAll(".scrim").forEach((s) => s.remove());
     const path = location.pathname;
     if (path === "/reset") return renderReset();
+    if (path.startsWith("/s/")) return renderShared(path.slice(3));
     if (!state.me) {
       if (path.startsWith("/w/")) store("w5-after", path);
       if (path !== "/") history.replaceState(null, "", "/");
@@ -763,7 +851,8 @@
       popMenu(anchor, [
         { text: "Rename project", onClick: renameProject },
         { text: "Change type…", onClick: convert },
-        { text: "Read the manuscript", onClick: () => go(`/p/${pid}/read`) },
+        { text: "Read, export or download", onClick: () => go(`/p/${pid}/read`) },
+        { text: "Share…", onClick: () => shareDialog(pid, project.title) },
         "-",
         { text: "Delete project", danger: true, onClick: deleteProject },
       ]);
@@ -792,12 +881,16 @@
     async function convert() {
       const target = await modal((box, close) => {
         let pick = null;
+        let breaks = true;
         const note = h("p", { class: "muted", style: { fontSize: "15px", minHeight: "3em" } });
+        const breakOpt = h("label", { class: "switch", style: { display: "none", marginTop: "4px" } },
+          h("input", { type: "checkbox", checked: true, onchange: (e) => { breaks = e.target.checked; if (pick) note.textContent = explain(pick); } }),
+          h("span", { class: "knob" }), h("span", { class: "muted", style: { fontSize: "15px" } }, "Put * * * between scenes"));
         const opts = h("div", { class: "types" });
-        const ok = h("button", { class: "btn primary", disabled: true, onclick: () => close(pick) }, "Change it");
+        const ok = h("button", { class: "btn primary", disabled: true, onclick: () => close({ type: pick, breaks }) }, "Change it");
         const explain = (t) => {
           const to = TYPES[t];
-          if (to.single && !def.single) return `Every scene is joined, in order, into one page with a * * * between scenes. Your overview and ${project.type === "play" ? "cast" : "characters"} are kept out of sight and come back if you change it again.`;
+          if (to.single && !def.single) return `Every scene is joined, in order, into one page${breaks ? " with a * * * between scenes" : ""}. Your overview and ${project.type === "play" ? "cast" : "characters"} are kept out of sight and come back if you change it again.`;
           if (def.single && !to.single) return to.container ? `Your page becomes the first scene of ${to.containerLabel.toLowerCase()} one, with an overview and characters to fill in.` : "Your page becomes the first scene, with an overview and characters to fill in.";
           if (to.single) return "The page stays exactly as it is.";
           if (to.container && def.container && to.container !== def.container) return `Your ${def.containerLabel.toLowerCase()}s become ${to.containerLabel.toLowerCase()}s, scenes and all.`;
@@ -806,17 +899,17 @@
           return "Your scenes, overview and characters all stay as they are.";
         };
         const draw = () => opts.replaceChildren(...TYPE_ORDER.filter((t) => t !== project.type).map((t) =>
-          h("button", { type: "button", class: "type-opt" + (t === pick ? " on" : ""), style: { "--spine": TYPES[t].spine }, onclick: () => { pick = t; ok.disabled = false; note.textContent = explain(t); draw(); } },
+          h("button", { type: "button", class: "type-opt" + (t === pick ? " on" : ""), style: { "--spine": TYPES[t].spine }, onclick: () => { pick = t; ok.disabled = false; note.textContent = explain(t); breakOpt.style.display = TYPES[t].single && !def.single ? "" : "none"; draw(); } },
             h("b", null, TYPES[t].label), h("span", null, TYPES[t].blurb))));
         draw();
-        box.append(h("h2", null, `Change “${project.title}” to…`), opts, h("div", { style: { marginTop: "14px" } }, note),
+        box.append(h("h2", null, `Change “${project.title}” to…`), opts, h("div", { style: { marginTop: "14px" } }, note), breakOpt,
           h("div", { class: "actions" }, h("button", { class: "btn ghost", onclick: () => close(null) }, "Cancel"), ok));
       });
       if (!target) return;
       try {
         if (leaveGuard) await leaveGuard();
-        await api("POST", `/api/projects/${pid}/convert`, { type: target });
-        toast(`It's a ${TYPES[target].label.toLowerCase()} now.`);
+        await api("POST", `/api/projects/${pid}/convert`, { type: target.type, breaks: target.breaks });
+        toast(`It's a ${TYPES[target.type].label.toLowerCase()} now.`);
         store(`w5-last-${pid}`, "");
         leaveGuard = null;
         go(`/p/${pid}`, true);
@@ -938,17 +1031,22 @@
       const countEl = h("span");
       const title = opts.title;
       const notes = opts.notes;
-      const body = noAI(h("textarea", {
+      // A formatted editor: bold and italics only. No AI, no suggestions.
+      const body = noAI(h("div", {
         class: "writing" + (project.type === "script" ? " mono" : project.type === "poem" ? " poem" : ""),
-        placeholder: opts.placeholder, spellcheck: "true", "aria-label": "Your writing",
+        contenteditable: "true", role: "textbox", "aria-multiline": "true", spellcheck: "true",
+        "aria-label": "Your writing", "data-placeholder": opts.placeholder,
       }));
-      body.value = nd.body || "";
+      body.innerHTML = storedToHtml(nd.body || "");
+      let current = nd.body || "";
+      const read = () => (current = serializeEditor(body));
 
       const live = () => {
-        const w = countWords(body.value);
+        const w = countWords(current);
         const contribution = Math.max(0, w - baseline - savedPasted - pendingPasted);
         updateMeter(todayOthers + contribution);
         countEl.textContent = plural(w, "word");
+        body.classList.toggle("empty", !current.trim() && !body.querySelector("b,i"));
         return w;
       };
       const setStatus = () => {
@@ -959,8 +1057,9 @@
         if (saving) { await saving; }
         if (!dirty) return;
         dirty = false;
+        read();
         const sendPasted = pendingPasted;
-        const payload = { body: body.value, pasted: sendPasted };
+        const payload = { body: current, pasted: sendPasted };
         if (title) payload.title = title.value;
         if (notes) payload.summary = notes.value;
         saving = (async () => {
@@ -993,9 +1092,15 @@
         if (dirty && !failed) await save();
       }
       const soon = debounce(save, 900);
-      const changed = () => { dirty = true; setStatus(); live(); soon(); };
-      body.addEventListener("input", () => { autosize(body); changed(); });
-      const onPaste = (text) => {
+      let frame = 0;
+      const changed = () => {
+        dirty = true; setStatus(); soon();
+        if (!frame) frame = requestAnimationFrame(() => { frame = 0; read(); live(); });
+      };
+      body.addEventListener("input", changed);
+      body.addEventListener("focus", () => { try { document.execCommand("defaultParagraphSeparator", false, "div"); document.execCommand("styleWithCSS", false, false); } catch {} });
+
+      const countPasted = (text) => {
         const n = countWords(text || "");
         if (!n) return;
         pendingPasted += n;
@@ -1004,8 +1109,48 @@
           toast("Pasted words go in your project, but they don't count toward the daily 500.");
         }
       };
-      body.addEventListener("paste", (e) => onPaste(e.clipboardData && e.clipboardData.getData("text")));
-      body.addEventListener("drop", (e) => onPaste(e.dataTransfer && e.dataTransfer.getData("text")));
+      // Paste and drop come in as plain text (formatting from elsewhere is dropped).
+      body.addEventListener("paste", (e) => {
+        e.preventDefault();
+        const text = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
+        if (!text) return;
+        countPasted(text);
+        document.execCommand("insertText", false, text.replace(/\r\n?/g, "\n"));
+      });
+      let internalDrag = false;
+      body.addEventListener("dragstart", () => { internalDrag = true; });
+      body.addEventListener("dragend", () => { internalDrag = false; });
+      body.addEventListener("drop", (e) => {
+        if (internalDrag) return;
+        e.preventDefault();
+        const text = e.dataTransfer && e.dataTransfer.getData("text/plain");
+        if (!text) return;
+        const pos = document.caretRangeFromPoint ? document.caretRangeFromPoint(e.clientX, e.clientY)
+          : document.caretPositionFromPoint ? (() => { const p = document.caretPositionFromPoint(e.clientX, e.clientY); const r = document.createRange(); r.setStart(p.offsetNode, p.offset); return r; })() : null;
+        if (pos) { const sel = getSelection(); sel.removeAllRanges(); sel.addRange(pos); }
+        countPasted(text);
+        document.execCommand("insertText", false, text);
+      });
+
+      const bBtn = h("button", { class: "fmt-btn", title: "Bold (Ctrl/⌘ B)", "aria-label": "Bold", onmousedown: (e) => e.preventDefault(), onclick: () => { body.focus(); document.execCommand("bold"); updateFmt(); } }, h("b", null, "B"));
+      const iBtn = h("button", { class: "fmt-btn", title: "Italic (Ctrl/⌘ I)", "aria-label": "Italic", onmousedown: (e) => e.preventDefault(), onclick: () => { body.focus(); document.execCommand("italic"); updateFmt(); } }, h("i", null, "I"));
+      function updateFmt() {
+        const inside = body.contains(getSelection().anchorNode);
+        let b = false, i = false;
+        try { b = inside && document.queryCommandState("bold"); i = inside && document.queryCommandState("italic"); } catch {}
+        bBtn.classList.toggle("on", !!b);
+        iBtn.classList.toggle("on", !!i);
+      }
+      body.addEventListener("keydown", (e) => {
+        const mod = e.metaKey || e.ctrlKey;
+        if (!mod || e.altKey) return;
+        const k = e.key.toLowerCase();
+        if (k === "b" || k === "i") { e.preventDefault(); document.execCommand(k === "b" ? "bold" : "italic"); updateFmt(); }
+        else if (k === "u") e.preventDefault(); // underline isn't kept, so don't offer it
+      });
+      document.addEventListener("selectionchange", updateFmt);
+      cleanup.push(() => document.removeEventListener("selectionchange", updateFmt));
+
       if (title) title.addEventListener("input", changed);
       if (notes) notes.addEventListener("input", () => { autosize(notes); changed(); });
 
@@ -1013,7 +1158,8 @@
       leaveGuard = flush;
       const beforeUnload = (e) => {
         if (!dirty) return;
-        const payload = { body: body.value, pasted: pendingPasted };
+        read();
+        const payload = { body: current, pasted: pendingPasted };
         if (title) payload.title = title.value;
         if (notes) payload.summary = notes.value;
         try {
@@ -1027,9 +1173,9 @@
       document.addEventListener("visibilitychange", onVis);
       cleanup.push(() => document.removeEventListener("visibilitychange", onVis));
 
-      const foot = h("div", { class: "paper-foot" }, countEl, h("span", null, "·"), status, h("div", { class: "spacer" }),
+      const foot = h("div", { class: "paper-foot" }, bBtn, iBtn, h("span", { class: "fmt-sep" }), countEl, h("span", null, "·"), status, h("div", { class: "spacer" }),
         h("button", { class: "btn ghost small", onclick: () => { setFocus(!state.focus); body.focus(); } }, icon(ICONS.focus, 16), "Focus"));
-      setTimeout(() => { autosize(body); notes && autosize(notes); live(); }, 0);
+      setTimeout(() => { notes && autosize(notes); live(); }, 0);
       return { body, foot, flush };
     }
 
@@ -1080,6 +1226,8 @@
           h("div", { class: "menu-wrap hide-focus" }, h("button", { class: "iconbtn", title: "Options", "aria-label": "Options", onclick: (e) => popMenu(e.currentTarget, [
             { text: "Rename", onClick: renameProject },
             { text: "Turn it into…", onClick: convert },
+            { text: "Export or download", onClick: async () => { if (leaveGuard) await leaveGuard(); go(`/p/${pid}/read`); } },
+            { text: "Share…", onClick: () => shareDialog(pid, project.title) },
             { text: "Focus mode", onClick: () => setFocus(true) },
             "-",
             { text: "Delete", danger: true, onClick: deleteProject },
@@ -1105,58 +1253,219 @@
   }
 
   // ---------- manuscript ----------
+  // Turn parts into a list of display items honoring the title/break options.
+  function manuscriptItems(parts, def, titles, breaks) {
+    const items = [];
+    let lastC;
+    parts.forEach((p, i) => {
+      if (def.container && p.containerId !== lastC) {
+        items.push({ kind: "container", text: p.container || "" });
+        lastC = p.containerId;
+      } else if (i > 0 && breaks && !def.single) items.push({ kind: "break" });
+      if (titles && !def.single && p.title) items.push({ kind: "title", text: p.title, part: p });
+      items.push({ kind: "body", part: p });
+    });
+    return items;
+  }
+
+  function bodyNode(stored, mono) {
+    const wrap = h("div", { class: "ms-body" + (mono ? " mono" : "") });
+    for (const runs of parseBody(stored.replace(/^\n+|\n+$/g, ""))) {
+      const plain = runs.map((r) => r.text).join("");
+      if (BREAK_LINE.test(plain)) { wrap.append(h("div", { class: "break" }, "* * *")); continue; }
+      const line = h("div", { class: "ms-line" });
+      if (plain) line.innerHTML = runsToHtml(runs); else line.append(h("br"));
+      wrap.append(line);
+    }
+    return wrap;
+  }
+
+  function manuscriptHtml(project, author, parts, def, titles, breaks) {
+    // No inline styles here (the page's security policy blocks them while copying).
+    const poemish = project.type === "poem" || project.type === "script";
+    let html = `<meta charset="utf-8"><h1 align="center">${escHtml(project.title)}</h1>`;
+    if (author) html += `<p align="center"><i>by ${escHtml(author)}</i></p>`;
+    for (const it of manuscriptItems(parts, def, titles, breaks)) {
+      if (it.kind === "container") html += `<h2 align="center">${escHtml(it.text)}</h2>`;
+      else if (it.kind === "break") html += `<p align="center">* * *</p>`;
+      else if (it.kind === "title") html += `<h3>${escHtml(it.text)}</h3>`;
+      else {
+        const lines = parseBody(it.part.body.replace(/^\n+|\n+$/g, ""));
+        let stanza = [];
+        const endStanza = () => { if (stanza.length) { html += `<p>${stanza.join("<br>")}</p>`; stanza = []; } };
+        for (const runs of lines) {
+          const plain = runs.map((r) => r.text).join("");
+          if (BREAK_LINE.test(plain)) { endStanza(); html += `<p align="center">* * *</p>`; }
+          else if (!plain.trim()) endStanza();
+          else if (poemish) stanza.push(runsToHtml(runs));
+          else html += `<p>${runsToHtml(runs)}</p>`;
+        }
+        endStanza();
+      }
+    }
+    return html;
+  }
+
+  function manuscriptText(project, parts, def, titles, breaks, md) {
+    const lines = [md ? `# ${project.title}` : project.title.toUpperCase(), ""];
+    for (const it of manuscriptItems(parts, def, titles, breaks)) {
+      if (it.kind === "container") lines.push("", md ? `## ${it.text}` : it.text.toUpperCase(), "");
+      else if (it.kind === "break") lines.push("", md ? "\\* \\* \\*" : "* * *", "");
+      else if (it.kind === "title") lines.push(md ? `### ${it.text}` : it.text, "");
+      else lines.push(md ? it.part.body.trim() : toPlain(it.part.body).trim(), "");
+    }
+    return lines.join("\n").replace(/\n{4,}/g, "\n\n\n") + "\n";
+  }
+
+  async function copyRich(html, text) {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html": new Blob([html], { type: "text/html" }),
+        "text/plain": new Blob([text], { type: "text/plain" }),
+      })]);
+      return true;
+    } catch {
+      // Older browsers: copy from a hidden formatted element.
+      const holder = h("div", { contenteditable: "true", style: { position: "fixed", left: "-9999px", top: "0" } });
+      holder.innerHTML = html;
+      document.body.append(holder);
+      const r = document.createRange(); r.selectNodeContents(holder);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch {}
+      sel.removeAllRanges(); holder.remove();
+      return ok;
+    }
+  }
+
   async function renderManuscript(pid) {
     const { project, parts } = await api("GET", `/api/projects/${pid}/manuscript`);
     const def = TYPES[project.type];
     document.title = `${project.title} (manuscript) · 500words`;
     let showTitles = store("w5-ms-titles") !== "0";
+    let showBreaks = store("w5-ms-breaks") !== "0";
     const total = parts.reduce((s, p) => s + p.words, 0);
     const body = h("div");
-    const mono = project.type === "script" ? " mono" : "";
+    const mono = project.type === "script";
     function draw() {
       const out = [];
-      let lastC = undefined;
-      parts.forEach((p, i) => {
-        if (def.container && p.containerId !== lastC) {
-          out.push(h("h2", { class: "ms-container" }, p.container || ""));
-          lastC = p.containerId;
-        } else if (i > 0 && !showTitles) out.push(h("div", { class: "break" }, "* * *"));
-        if (showTitles && !def.single) out.push(h("h3", { class: "ms-scene" }, link(`/p/${pid}/${p.id}`, null, p.title || "Untitled")));
-        out.push(p.body.trim() ? h("div", { class: "ms-body" + mono }, p.body.trim()) : h("p", { class: "unwritten" }, link(`/p/${pid}/${p.id}`, null, "Not written yet — write it now")));
-      });
+      for (const it of manuscriptItems(parts, def, showTitles, showBreaks)) {
+        if (it.kind === "container") out.push(h("h2", { class: "ms-container" }, it.text));
+        else if (it.kind === "break") out.push(h("div", { class: "break" }, "* * *"));
+        else if (it.kind === "title") out.push(h("h3", { class: "ms-scene" }, link(`/p/${pid}/${it.part.id}`, null, it.text)));
+        else out.push(it.part.body.trim() ? bodyNode(it.part.body, mono) : h("p", { class: "unwritten" }, link(`/p/${pid}/${it.part.id}`, null, `${it.part.title || "This scene"} isn't written yet — write it now`)));
+      }
       body.replaceChildren(...out);
     }
     draw();
-    function asText(md) {
-      const lines = [md ? `# ${project.title}` : project.title.toUpperCase(), ""];
-      let lastC;
-      parts.forEach((p, i) => {
-        if (def.container && p.containerId !== lastC) { lines.push("", md ? `## ${p.container}` : p.container.toUpperCase(), ""); lastC = p.containerId; }
-        else if (i > 0) lines.push("", md ? "* * *" : "* * *", "");
-        if (showTitles && !def.single && p.title) lines.push(md ? `### ${p.title}` : p.title, "");
-        lines.push(p.body.trim());
-      });
-      return lines.join("\n").replace(/\n{4,}/g, "\n\n\n") + "\n";
-    }
+    const filename = (ext) => `${project.title.replace(/[^\p{L}\p{N}\-' ]+/gu, "").trim() || "manuscript"}.${ext}`;
     function download(md) {
-      const blob = new Blob([asText(md)], { type: md ? "text/markdown" : "text/plain" });
-      const a = h("a", { href: URL.createObjectURL(blob), download: `${project.title.replace(/[^\w\- ]+/g, "").trim() || "manuscript"}.${md ? "md" : "txt"}` });
+      const blob = new Blob([manuscriptText(project, parts, def, showTitles, showBreaks, md)], { type: md ? "text/markdown" : "text/plain" });
+      const a = h("a", { href: URL.createObjectURL(blob), download: filename(md ? "md" : "txt") });
       document.body.append(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     }
-    const tgl = h("label", { class: "switch" }, h("input", { type: "checkbox", checked: showTitles, onchange: (e) => { showTitles = e.target.checked; store("w5-ms-titles", showTitles ? "1" : "0"); draw(); } }), h("span", { class: "knob" }), h("span", { class: "muted", style: { fontSize: "15px" } }, "Scene titles"));
+    const word = () => { location.href = `/api/projects/${pid}/export.docx?titles=${showTitles ? 1 : 0}&breaks=${showBreaks ? 1 : 0}`; };
+    async function google() {
+      const ok = await copyRich(manuscriptHtml(project, state.me.displayName, parts, def, showTitles, showBreaks), manuscriptText(project, parts, def, showTitles, showBreaks, false));
+      if (!ok) { toast("Your browser wouldn't let us copy. Download the Word file and upload it to Google Drive instead.", true); return; }
+      modal((box, close) => box.append(
+        h("h2", null, "Copied — now paste it into Google Docs"),
+        h("p", { class: "muted" }, "Your whole manuscript, with headings, bold and italics, is on your clipboard. Open a new Google Doc and paste (Ctrl+V, or ⌘V on a Mac)."),
+        h("p", { class: "faint", style: { fontSize: "14px" } }, "Prefer a file? Use Word (.docx) — Google Drive opens it as a Google Doc when you upload it."),
+        h("div", { class: "actions" },
+          h("button", { class: "btn ghost", onclick: () => close() }, "Close"),
+          h("a", { class: "btn primary", href: "https://docs.new", target: "_blank", rel: "noopener noreferrer", onclick: () => setTimeout(close, 100) }, "Open a new Google Doc"))));
+    }
+    const sw = (label, on, set) => h("label", { class: "switch" }, h("input", { type: "checkbox", checked: on, onchange: (e) => set(e.target.checked) }), h("span", { class: "knob" }), h("span", { class: "muted", style: { fontSize: "15px" } }, label));
+    const exportMenu = h("div", { class: "menu-wrap" }, h("button", { class: "btn small primary", onclick: (e) => popMenu(e.currentTarget, [
+      { text: "Word (.docx)", onClick: word },
+      { text: "Copy for Google Docs", onClick: google },
+      "-",
+      { text: "Plain text (.txt)", onClick: () => download(false) },
+      { text: "Markdown (.md)", onClick: () => download(true) },
+    ]) }, "Export"));
     shell(h("div", { class: "page" },
       h("div", { class: "manuscript" },
-        h("div", { class: "row wrap", style: { justifyContent: "space-between", marginBottom: "10px" } },
+        h("div", { class: "row wrap", style: { justifyContent: "space-between", marginBottom: "10px", rowGap: "10px" } },
           link(`/p/${pid}`, { class: "btn ghost small" }, "← Back to writing"),
-          h("div", { class: "row wrap" }, def.single ? null : tgl,
-            h("button", { class: "btn small", onclick: () => download(false) }, "Download .txt"),
-            h("button", { class: "btn small", onclick: () => download(true) }, "Download .md"))),
+          h("div", { class: "row wrap", style: { rowGap: "10px" } },
+            def.single ? null : sw("Scene titles", showTitles, (v) => { showTitles = v; store("w5-ms-titles", v ? "1" : "0"); draw(); }),
+            def.single ? null : sw("Breaks between scenes", showBreaks, (v) => { showBreaks = v; store("w5-ms-breaks", v ? "1" : "0"); draw(); }),
+            h("button", { class: "btn small", onclick: () => shareDialog(pid, project.title) }, "Share"),
+            exportMenu)),
         h("div", { style: { textAlign: "center", margin: "40px 0 10px" } },
           h("div", { class: "label" }, def.label),
           h("h1", { style: { fontSize: "40px", marginTop: "6px" } }, project.title),
           h("div", { class: "faint", style: { marginTop: "10px" } }, plural(total, "word"), def.single ? "" : ` · ${plural(parts.length, "scene")}`)),
         body)));
+  }
+
+  // ---------- sharing ----------
+  async function shareDialog(pid, title) {
+    let st;
+    try { st = await api("GET", `/api/projects/${pid}/share`); } catch (e) { toast(e.message, true); return; }
+    await modal((box, close) => {
+      const draw = () => {
+        const url = st.token ? `${location.origin}/s/${st.token}` : "";
+        const set = async (patch) => {
+          try { st = await api("POST", `/api/projects/${pid}/share`, patch); draw(); } catch (e) { toast(e.message, true); }
+        };
+        const linkBox = h("input", { class: "text", value: url, readonly: true, onfocus: (e) => e.target.select() });
+        box.replaceChildren(
+          h("h2", null, `Share “${title}”`),
+          h("p", { class: "muted", style: { fontSize: "15.5px" } }, "Anyone with the link can read this story — no account needed. They see the finished text only: no notes, no characters, nothing else on your desk. It always shows your latest words."),
+          h("label", { class: "switch", style: { margin: "14px 0" } },
+            h("input", { type: "checkbox", checked: !!st.token, onchange: (e) => set({ enabled: e.target.checked }) }), h("span", { class: "knob" }),
+            h("span", null, st.token ? "Sharing is on" : "Sharing is off")),
+          st.token ? h("div", { class: "stack" },
+            h("div", { class: "row" }, linkBox,
+              h("button", { class: "btn primary", onclick: async () => { try { await navigator.clipboard.writeText(url); toast("Link copied."); } catch { linkBox.select(); document.execCommand("copy"); toast("Link copied."); } } }, "Copy")),
+            h("div", { class: "row wrap" },
+              h("label", { class: "switch" }, h("input", { type: "checkbox", checked: st.titles, onchange: (e) => set({ titles: e.target.checked }) }), h("span", { class: "knob" }), h("span", { class: "muted", style: { fontSize: "15px" } }, "Scene titles")),
+              h("label", { class: "switch" }, h("input", { type: "checkbox", checked: st.breaks, onchange: (e) => set({ breaks: e.target.checked }) }), h("span", { class: "knob" }), h("span", { class: "muted", style: { fontSize: "15px" } }, "Breaks between scenes"))),
+            h("p", { class: "faint", style: { fontSize: "14px" } }, "Shared it with the wrong person? ",
+              h("button", { class: "btn ghost small", onclick: () => set({ enabled: true, newLink: true }) }, "Make a new link"),
+              " — the old one stops working.")) : null,
+          h("div", { class: "actions" }, h("button", { class: "btn primary", onclick: () => close() }, "Done")));
+      };
+      draw();
+    });
+  }
+
+  async function renderShared(token) {
+    document.title = "500words";
+    let d;
+    try {
+      d = await api("GET", `/api/shared/${encodeURIComponent(token)}`);
+    } catch (e) {
+      app.replaceChildren(h("div", { class: "page narrow", style: { textAlign: "center", paddingTop: "80px" } },
+        h("div", { class: "wordmark-dark" }, h("b", null, "500"), "words"),
+        h("h1", { style: { marginTop: "30px" } }, "This story isn't shared anymore"),
+        h("p", { class: "muted" }, "The writer may have turned the link off or made a new one.")));
+      return;
+    }
+    const def = TYPES[d.project.type];
+    document.title = `${d.project.title} · ${d.project.author} · 500words`;
+    const mono = d.project.type === "script";
+    const out = [];
+    for (const it of manuscriptItems(d.parts, def, d.titles, d.breaks)) {
+      if (it.kind === "container") out.push(h("h2", { class: "ms-container" }, it.text));
+      else if (it.kind === "break") out.push(h("div", { class: "break" }, "* * *"));
+      else if (it.kind === "title") out.push(h("h3", { class: "ms-scene" }, it.text));
+      else if (it.part.body.trim()) out.push(bodyNode(it.part.body, mono));
+    }
+    app.replaceChildren(
+      h("header", { class: "shared-bar" },
+        h("a", { class: "wordmark-dark", href: "/" }, h("b", null, "500"), "words"),
+        h("button", { class: "iconbtn", title: "Day / evening lamp", "aria-label": "Switch light", onclick: toggleTheme }, icon(ICONS.lamp))),
+      h("div", { class: "page" }, h("article", { class: "manuscript" },
+        h("div", { style: { textAlign: "center", margin: "30px 0 10px" } },
+          h("div", { class: "label" }, def.label),
+          h("h1", { style: { fontSize: "40px", marginTop: "6px" } }, d.project.title),
+          h("div", { class: "muted", style: { marginTop: "10px", fontStyle: "italic" } }, `by ${d.project.author}`)),
+        out,
+        h("p", { class: "faint", style: { textAlign: "center", marginTop: "60px", fontSize: "14px" } }, "Written by a person, in 500words. No AI writes here."))));
   }
 
   // ---------- stats ----------

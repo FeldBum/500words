@@ -3,7 +3,8 @@ import { countWords, dayIn, validTimezone, streaks, DAILY_GOAL } from "./words";
 import { TYPES, isType, containerTitle, type ProjectType } from "./types";
 import { join, normalize } from "node:path";
 import { mailer, resetEmail } from "./mail";
-import { parseDocx, parseText, fetchGoogle, planImport, summarize, suggestType, validateBlocks, ImportError, type Plan } from "./importer";
+import { buildDocx, safeFilename } from "./export-docx";
+import { parseDocx, parseText, SCENE_BREAK, fetchGoogle, planImport, summarize, suggestType, validateBlocks, ImportError, type Plan } from "./importer";
 
 // Swappable in tests.
 export const deps = { fetch: (...a: Parameters<typeof fetch>) => fetch(...a) };
@@ -304,7 +305,7 @@ async function createProject(db: any, userId: number, type: ProjectType, title: 
   return p;
 }
 
-async function convertProject(db: any, user: User, project: any, target: ProjectType) {
+async function convertProject(db: any, user: User, project: any, target: ProjectType, breaks = true) {
   if (project.type === target) return;
   const def = TYPES[target];
   const day = dayIn(user.timezone);
@@ -319,7 +320,7 @@ async function convertProject(db: any, user: User, project: any, target: Project
     if (!page) {
       page = await insertNode(db, project.id, null, "page", "");
     } else if (leaves.length > 1) {
-      const joined = leaves.map((l: any) => l.body.trim()).filter(Boolean).join("\n\n* * *\n\n");
+      const joined = leaves.map((l: any) => l.body.trim()).filter(Boolean).join(breaks ? `\n\n${SCENE_BREAK}\n\n` : "\n\n");
       const w = countWords(joined);
       await shiftBaseline(db, user.id, page.id, day, w - page.words);
       await db`update nodes set body = ${joined}, words = ${w}, updated_at = now() where id = ${page.id}`;
@@ -673,9 +674,80 @@ route("POST", "/api/projects/:id/convert", true, async ({ req, params }, user) =
   await sql.begin(async (tx) => {
     const p = await ownProject(user!.id, id(params.id), tx);
     await tx`select id from nodes where project_id = ${p.id} for update`;
-    await convertProject(tx, user!, p, b.type);
+    await convertProject(tx, user!, p, b.type, b.breaks !== false);
   });
   return json({ ok: true });
+});
+
+async function manuscriptParts(projectId: number) {
+  const nodes = await sql`select * from nodes where project_id = ${projectId}`;
+  const containers = new Map(nodes.filter((n: any) => n.kind === "chapter" || n.kind === "act").map((n: any) => [n.id, n]));
+  return orderedLeaves(nodes).map((l: any) => ({
+    id: l.id,
+    title: l.title,
+    container: l.parent_id ? (containers.get(l.parent_id) as any)?.title ?? null : null,
+    containerId: l.parent_id,
+    body: l.body,
+    words: l.words,
+  }));
+}
+
+const flag = (v: string | null, dflt: boolean) => (v === null ? dflt : v === "1" || v === "true");
+
+route("GET", "/api/projects/:id/export.docx", true, async ({ params, url }, user) => {
+  const p = await ownProject(user!.id, id(params.id));
+  const parts = await manuscriptParts(p.id);
+  const def = TYPES[p.type as ProjectType];
+  const buf = await buildDocx({
+    title: p.title, author: user!.display_name, type: p.type, parts,
+    titles: flag(url.searchParams.get("titles"), true), breaks: flag(url.searchParams.get("breaks"), true),
+    hasContainers: !!def.container, single: def.single,
+  });
+  const name = safeFilename(p.title);
+  return new Response(buf, {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "content-disposition": `attachment; filename="${name.replace(/[^\x20-\x7e]/g, "_")}.docx"; filename*=UTF-8''${encodeURIComponent(name)}.docx`,
+      "cache-control": "no-store",
+    },
+  });
+});
+
+// ---- sharing one story by private link
+
+function shareState(p: any) {
+  return { token: p.share_token ?? null, titles: p.share_titles, breaks: p.share_breaks };
+}
+
+route("GET", "/api/projects/:id/share", true, async ({ params }, user) => {
+  const p = await ownProject(user!.id, id(params.id));
+  return json(shareState(p));
+});
+
+route("POST", "/api/projects/:id/share", true, async ({ req, params }, user) => {
+  const p = await ownProject(user!.id, id(params.id));
+  const b = await body(req);
+  let token = p.share_token;
+  if (b.enabled === false) token = null;
+  else if (b.enabled === true && (!token || b.newLink)) token = newToken();
+  const titles = b.titles !== undefined ? !!b.titles : p.share_titles;
+  const breaks = b.breaks !== undefined ? !!b.breaks : p.share_breaks;
+  const r = await sql`update projects set share_token = ${token}, share_titles = ${titles}, share_breaks = ${breaks}
+                      where id = ${p.id} returning share_token, share_titles, share_breaks`;
+  return json(shareState(r[0]));
+});
+
+route("GET", "/api/shared/:token", false, async ({ params }) => {
+  const token = decodeURIComponent(params.token);
+  if (!/^[A-Za-z0-9_-]{20,60}$/.test(token)) throw notFound();
+  const r = await sql`select p.*, u.display_name from projects p join users u on u.id = p.user_id where p.share_token = ${token}`;
+  if (!r.length) throw new HttpError(404, "This link isn't shared anymore.");
+  const p = r[0];
+  const parts = (await manuscriptParts(p.id)).map(({ id: _id, ...rest }) => rest);
+  return json({
+    project: { title: p.title, type: p.type, author: p.display_name },
+    parts, titles: p.share_titles, breaks: p.share_breaks,
+  }, 200, { "x-robots-tag": "noindex, nofollow" });
 });
 
 route("GET", "/api/projects/:id/manuscript", true, async ({ params }, user) => {
@@ -926,7 +998,9 @@ export async function handle(req: Request, server: any): Promise<Response> {
     if (req.method === "GET" || req.method === "HEAD") {
       const s = await serveStatic(url.pathname);
       if (s) return s;
-      return serveIndex();
+      const page = await serveIndex();
+      if (url.pathname.startsWith("/s/") || url.pathname === "/reset") page.headers.set("x-robots-tag", "noindex, nofollow");
+      return page;
     }
     throw notFound();
   } catch (e: any) {

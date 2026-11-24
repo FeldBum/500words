@@ -172,7 +172,7 @@ test("convert freeform → novel → play → short story → poem, keeping word
   const single = nodes.filter((n: any) => n.kind === "page");
   expect(single.length).toBe(1);
   const full = (await c.get(`/api/nodes/${single[0].id}`)).data.node;
-  expect(full.body).toBe("Once upon a time there was a lamp.\n\n* * *\n\nThe lamp went out.");
+  expect(full.body).toBe("Once upon a time there was a lamp.\n\n\\* \\* \\*\n\nThe lamp went out.");
   // Joining scenes isn't new writing: today's count is unchanged.
   expect((await c.get("/api/stats")).data.todayWords).toBe(mid);
   expect(mid).toBeGreaterThan(before);
@@ -421,4 +421,123 @@ test("reset is refused politely when email isn't configured", async () => {
     expect(r.status).toBe(503);
     expect((await new Client().get("/api/me")).data.resetEnabled).toBe(false);
   } finally { mailer.enabled = realEnabled; }
+});
+
+
+// ---------------------------------------------------------------------------
+// Formatting, Word export, sharing
+const fmt = await import("../src/format");
+const mammothLib = (await import("mammoth")).default;
+
+test("stored format: bold/italic marks and escapes round-trip", () => {
+  const body = "She was _not_ going back. **Never.**\nSnake\\_case and 2\\*3 stay \\\\ literal.\n**bold and _both_**";
+  const lines = fmt.parseBody(body);
+  expect(lines[0]).toEqual([
+    { text: "She was ", b: false, i: false }, { text: "not", b: false, i: true },
+    { text: " going back. ", b: false, i: false }, { text: "Never.", b: true, i: false },
+  ]);
+  expect(fmt.toPlain(body).split("\n")[1]).toBe("Snake_case and 2*3 stay \\ literal.");
+  expect(lines[2]).toEqual([{ text: "bold and ", b: true, i: false }, { text: "both", b: true, i: true }]);
+  expect(fmt.escapeText("a*b_c\\")).toBe("a\\*b\\_c\\\\");
+  expect(countWords(body)).toBe(16);
+  expect(fmt.fromMarkdown("It was *very* __bold__ of snake_case")).toBe("It was _very_ **bold** of snake\\_case");
+});
+
+test("Word import keeps bold and italics, and literal * and _", async () => {
+  const c = await user("fmt_importer");
+  const r = (await upload(c, "f.docx", await fixture("formatted.docx"))).data;
+  const para = r.blocks.find((b: any) => b.t === "p").text;
+  expect(para).toBe("She was _not_ going back. **Never.** Snake\\_case and 2\\*3 stay literal.");
+});
+
+test("converting to one page can leave out the scene breaks", async () => {
+  const c = await user("nobreaks");
+  const p = (await c.post("/api/projects", { type: "short_story", title: "S" })).data.project;
+  let { nodes } = (await c.get(`/api/projects/${p.id}`)).data;
+  const s1 = nodes.find((n: any) => n.kind === "scene");
+  await c.put(`/api/nodes/${s1.id}`, { body: "First." });
+  const s2 = (await c.post(`/api/projects/${p.id}/nodes`, { kind: "scene" })).data.node;
+  await c.put(`/api/nodes/${s2.id}`, { body: "Second." });
+  await c.post(`/api/projects/${p.id}/convert`, { type: "freeform", breaks: false });
+  ({ nodes } = (await c.get(`/api/projects/${p.id}`)).data);
+  const page = (await c.get(`/api/nodes/${nodes.find((n: any) => n.kind === "page").id}`)).data.node;
+  expect(page.body).toBe("First.\n\nSecond.");
+});
+
+async function docxText(c: Client, path: string) {
+  const res = await handle(new Request("http://localhost" + path, { headers: { cookie: c.cookie } }), null);
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-type")).toContain("wordprocessingml");
+  const buf = Buffer.from(await res.arrayBuffer());
+  return (await mammothLib.convertToHtml({ buffer: buf })).value;
+}
+
+test("Word export: chapters, scene titles and breaks as chosen, bold and italics kept", async () => {
+  const c = await user("exporter");
+  const p = (await c.post("/api/projects", { type: "novel", title: "Lamp & Rock" })).data.project;
+  let { nodes } = (await c.get(`/api/projects/${p.id}`)).data;
+  const ch = nodes.find((n: any) => n.kind === "chapter");
+  const s1 = nodes.find((n: any) => n.kind === "scene");
+  await c.put(`/api/nodes/${s1.id}`, { title: "Arrival", body: "She was _not_ going back.\n\n**Never.**" });
+  const s2 = (await c.post(`/api/projects/${p.id}/nodes`, { kind: "scene", parentId: ch.id, title: "Night" })).data.node;
+  await c.put(`/api/nodes/${s2.id}`, { body: "The lamp failed." });
+
+  let html = await docxText(c, `/api/projects/${p.id}/export.docx?titles=1&breaks=1`);
+  expect(html).toContain("Lamp &amp; Rock");
+  expect(html).toContain("<h1>Chapter 1</h1>");
+  expect(html).toContain("<h2>Arrival</h2>");
+  expect(html).toContain("<em>not</em>");
+  expect(html).toContain("<strong>Never.</strong>");
+  expect(html).toContain("* * *");
+  html = await docxText(c, `/api/projects/${p.id}/export.docx?titles=0&breaks=0`);
+  expect(html).not.toContain("Arrival");
+  expect(html).not.toContain("* * *");
+  expect(html).toContain("The lamp failed.");
+  // Someone else can't export it.
+  const other = await user("not_the_owner");
+  const res = await handle(new Request(`http://localhost/api/projects/${p.id}/export.docx`, { headers: { cookie: other.cookie } }), null);
+  expect(res.status).toBe(404);
+});
+
+test("sharing one story by link", async () => {
+  const c = await user("sharer");
+  const p = (await c.post("/api/projects", { type: "short_story", title: "Shared Tale" })).data.project;
+  let { nodes } = (await c.get(`/api/projects/${p.id}`)).data;
+  const scene = nodes.find((n: any) => n.kind === "scene");
+  await c.put(`/api/nodes/${scene.id}`, { body: "Once, _quietly_." });
+  await c.put(`/api/nodes/${nodes.find((n: any) => n.kind === "overview").id}`, { body: "SECRET PLOT NOTES" });
+  await c.put(`/api/nodes/${scene.id}`, { summary: "private scene note" });
+  const other = (await c.post("/api/projects", { type: "freeform", title: "Diary" })).data.project;
+
+  expect((await c.get(`/api/projects/${p.id}/share`)).data.token).toBeNull();
+  const on = (await c.post(`/api/projects/${p.id}/share`, { enabled: true })).data;
+  expect(on.token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+  const anon = new Client();
+  const view = await anon.get(`/api/shared/${on.token}`);
+  expect(view.status).toBe(200);
+  expect(view.data.project).toEqual({ title: "Shared Tale", type: "short_story", author: "sharer" });
+  expect(view.data.parts[0].body).toBe("Once, _quietly_.");
+  const raw = JSON.stringify(view.data);
+  expect(raw).not.toContain("SECRET PLOT");
+  expect(raw).not.toContain("private scene note");
+  expect(raw).not.toContain("Diary");
+  expect(raw).not.toContain(`"id"`);
+
+  const opts = (await c.post(`/api/projects/${p.id}/share`, { titles: false, breaks: false })).data;
+  expect(opts.token).toBe(on.token);
+  expect((await anon.get(`/api/shared/${on.token}`)).data.titles).toBe(false);
+
+  // A new link retires the old one; turning sharing off retires it too.
+  const fresh = (await c.post(`/api/projects/${p.id}/share`, { enabled: true, newLink: true })).data;
+  expect(fresh.token).not.toBe(on.token);
+  expect((await anon.get(`/api/shared/${on.token}`)).status).toBe(404);
+  expect((await anon.get(`/api/shared/${fresh.token}`)).status).toBe(200);
+  await c.post(`/api/projects/${p.id}/share`, { enabled: false });
+  expect((await anon.get(`/api/shared/${fresh.token}`)).status).toBe(404);
+
+  // Only the owner controls sharing.
+  const stranger = await user("share_stranger");
+  expect((await stranger.post(`/api/projects/${p.id}/share`, { enabled: true })).status).toBe(404);
+  expect((await anon.post(`/api/projects/${p.id}/share`, { enabled: true })).status).toBe(401);
+  expect((await anon.get(`/api/shared/not-a-real-token`)).status).toBe(404);
 });

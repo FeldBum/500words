@@ -79,6 +79,14 @@ const MIGRATIONS: string[] = [
   );
   create index password_resets_user on password_resets(user_id);
   `,
+  // 3: bold/italic marks (escape existing text) + share links
+  `
+  update nodes set body = replace(replace(replace(body, '\\', '\\\\'), '*', '\\*'), '_', '\\_')
+    where kind in ('scene', 'page', 'overview', 'character') and body <> '';
+  alter table projects add column share_token text unique;
+  alter table projects add column share_titles boolean not null default true;
+  alter table projects add column share_breaks boolean not null default true;
+  `,
 ];
 
 export async function migrate() {
