@@ -10,9 +10,14 @@
     poem: { label: "Poem", container: null, single: true, plural: "Poems", spine: "#5b4a7a", blurb: "A single page." },
     script: { label: "Movie script", container: "act", containerLabel: "Act", plural: "Movie scripts", spine: "#2e4f6e", blurb: "Acts and scenes, in screenplay type." },
     play: { label: "Play", container: "act", containerLabel: "Act", plural: "Plays", spine: "#7a3b44", blurb: "Acts and scenes, with a cast list." },
+    memoir: { label: "Memoir", container: "chapter", containerLabel: "Chapter", plural: "Memoirs", spine: "#4f6b3a", blurb: "Chapters and scenes from your life, with the people in it.", people: true },
+    personal_essay: { label: "Personal essay", container: null, single: true, notes: true, plural: "Personal essays", spine: "#9a5a6b", blurb: "One piece, plus a page of notes." },
+    article: { label: "Article / essay", container: null, single: true, notes: true, plural: "Articles & essays", spine: "#5a6e78", blurb: "Op-eds, posts, newsletters: one piece plus notes." },
     freeform: { label: "Freeform", container: null, single: true, plural: "Freeform", spine: "#a9864f", blurb: "A single page. Just write — sort it out later." },
   };
-  const TYPE_ORDER = ["novel", "short_story", "script", "play", "poem", "freeform"];
+  const TYPE_ORDER = ["novel", "memoir", "short_story", "personal_essay", "article", "script", "play", "poem", "freeform"];
+  // What a type calls its characters.
+  const castWord = (type, one = false) => type === "play" ? "Cast" : TYPES[type].people ? (one ? "Person" : "People") : (one ? "Character" : "Characters");
 
   // Must match src/words.ts exactly.
   const WORD = /[\p{L}\p{N}][\p{L}\p{N}\p{M}'’\-]*/gu;
@@ -744,8 +749,11 @@
 
     // Choose the node to open.
     if (def.single) {
-      const page = nodes.find((n) => n.kind === "page");
-      nodeId = page ? page.id : null;
+      const notesNode = def.notes ? nodes.find((n) => n.kind === "overview") : null;
+      if (!(notesNode && nodeId === notesNode.id)) {
+        const page = nodes.find((n) => n.kind === "page");
+        nodeId = page ? page.id : null;
+      }
     } else if (!nodeId || !byId().has(nodeId)) {
       const last = Number(store(`w5-last-${pid}`));
       if (last && byId().has(last)) nodeId = last;
@@ -812,7 +820,7 @@
         h("div", { class: "head" }, h("span", { class: "label" }, "Plan")),
         top("overview").map((n) => railItem(n)),
         h("div", { class: "head", style: { marginTop: "8px" } },
-          h("span", { class: "label" }, project.type === "play" ? "Cast" : "Characters"),
+          h("span", { class: "label" }, castWord(project.type)),
           h("button", { class: "add-link", onclick: () => addNode("character") }, "+ Add")),
         top("character").map((n) => railItem(n)),
         top("character").length ? null : h("div", { class: "faint", style: { fontSize: "14px", padding: "2px 8px" } }, "No one yet."));
@@ -890,9 +898,12 @@
         const ok = h("button", { class: "btn primary", disabled: true, onclick: () => close({ type: pick, breaks }) }, "Change it");
         const explain = (t) => {
           const to = TYPES[t];
-          if (to.single && !def.single) return `Every scene is joined, in order, into one page${breaks ? " with a * * * between scenes" : ""}. Your overview and ${project.type === "play" ? "cast" : "characters"} are kept out of sight and come back if you change it again.`;
+          const cast = castWord(project.type).toLowerCase();
+          if (to.single && !def.single) return `Every scene is joined, in order, into one page${breaks ? " with a * * * between scenes" : ""}. ` +
+            (to.notes ? `Your overview becomes its Notes page; your ${cast} are kept out of sight and come back if you change it again.` : `Your overview and ${cast} are kept out of sight and come back if you change it again.`);
+          if (def.single && !to.single && def.notes) return `Your piece becomes the first scene${to.container ? ` of ${to.containerLabel.toLowerCase()} one` : ""}, and your notes become the overview.`;
           if (def.single && !to.single) return to.container ? `Your page becomes the first scene of ${to.containerLabel.toLowerCase()} one, with an overview and characters to fill in.` : "Your page becomes the first scene, with an overview and characters to fill in.";
-          if (to.single) return "The page stays exactly as it is.";
+          if (to.single) return def.notes && !to.notes ? "The page stays exactly as it is; your notes are kept out of sight and come back if you change it again." : "The page stays exactly as it is.";
           if (to.container && def.container && to.container !== def.container) return `Your ${def.containerLabel.toLowerCase()}s become ${to.containerLabel.toLowerCase()}s, scenes and all.`;
           if (to.container && !def.container) return `All your scenes go into ${to.containerLabel} One, in order.`;
           if (!to.container && def.container) return `Scenes stay in reading order; the ${def.containerLabel.toLowerCase()} headings go away.`;
@@ -1182,11 +1193,11 @@
     function renderScene(nd, info) {
       const isScene = nd.kind === "scene";
       const isChar = nd.kind === "character";
-      const crumbs = isScene && parent ? `${parent.title} · Scene` : nd.kind === "overview" ? "Overview & plot" : isChar ? (project.type === "play" ? "Cast" : "Character") : "Scene";
+      const crumbs = isScene && parent ? `${parent.title} · Scene` : nd.kind === "overview" ? "Overview & plot" : isChar ? castWord(project.type, true) : "Scene";
       const title = nd.kind === "overview" ? null : noAI(h("input", { class: "title-input", value: nd.title, maxlength: 200, placeholder: isChar ? "Name" : "Scene title" }));
       let notes = null, notesWrap = null;
       if (isScene || isChar) {
-        notes = noAI(h("textarea", { class: "notes", rows: 2, placeholder: isScene ? "What happens here? Planning notes — they don't count toward your 500." : "In a line: who are they, and what do they want?" }));
+        notes = noAI(h("textarea", { class: "notes", rows: 2, placeholder: isScene ? "What happens here? Planning notes — they don't count toward your 500." : (TYPES[project.type].people ? "In a line: who are they to you?" : "In a line: who are they, and what do they want?") }));
         notes.value = nd.summary;
         const open = !!nd.summary || isChar;
         notesWrap = h("div", { style: { display: open ? "" : "none" } }, notes);
@@ -1196,7 +1207,7 @@
       }
       const placeholder = nd.kind === "overview"
         ? "What's it about? The premise, the plot, the ending you're aiming for…"
-        : isChar ? "Who they are, how they talk, what they're hiding…"
+        : isChar ? (TYPES[project.type].people ? "Who they are, what they were like then, what you remember…" : "Who they are, how they talk, what they're hiding…")
         : project.type === "script" ? "INT. SOMEWHERE — NIGHT" : "Begin.";
       const ed = makeEditor(nd, info.day, { title, notes, placeholder });
       pane.replaceChildren(
@@ -1215,7 +1226,16 @@
     }
 
     function renderSingle(nd, info) {
-      const ed = makeEditor(nd, info.day, { placeholder: project.type === "poem" ? "Begin your poem." : "Just write. Anything at all." });
+      const onNotes = nd.kind === "overview";
+      const placeholder = onNotes
+        ? (project.type === "personal_essay" ? "The idea, the moment it turns on, the people in it, what you want the reader to feel…" : "The argument, sources, quotes, the outline…")
+        : project.type === "poem" ? "Begin your poem." : def.notes ? "Begin." : "Just write. Anything at all.";
+      const ed = makeEditor(nd, info.day, { placeholder });
+      const notesNode = def.notes ? nodes.find((x) => x.kind === "overview") : null;
+      const tabs = notesNode ? h("div", { class: "tabs hide-focus", style: { marginBottom: "16px", maxWidth: "740px", marginLeft: "auto", marginRight: "auto" } },
+        h("button", { class: onNotes ? "" : "on", onclick: () => onNotes && go(`/p/${pid}`) }, def.label === "Article / essay" ? "Article" : "Essay"),
+        h("button", { class: onNotes ? "on" : "", onclick: () => !onNotes && go(`/p/${pid}/${notesNode.id}`) }, "Notes",
+          notesNode.words ? h("span", { class: "faint", style: { fontSize: "13px", marginLeft: "6px" } }, fmt(notesNode.words)) : null)) : null;
       pane.replaceChildren(
         h("div", { class: "focus-meter" }),
         h("button", { class: "btn small focus-exit", onclick: () => setFocus(false) }, "Leave focus"),
@@ -1232,6 +1252,7 @@
             "-",
             { text: "Delete", danger: true, onClick: deleteProject },
           ]) }, icon(ICONS.more)))),
+        tabs,
         h("div", { class: "paper" }, ed.body),
         ed.foot);
       updateMeter(state.todayWords);

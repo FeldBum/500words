@@ -1,4 +1,4 @@
-export type ProjectType = "novel" | "short_story" | "poem" | "script" | "play" | "freeform";
+export type ProjectType = "novel" | "memoir" | "short_story" | "personal_essay" | "article" | "poem" | "script" | "play" | "freeform";
 
 export interface TypeDef {
   label: string;
@@ -7,11 +7,16 @@ export interface TypeDef {
   // Single-page types have one "page" and nothing else on show.
   single: boolean;
   containerLabel?: string;
+  // Single-page types that also keep a notes page (stored as the overview).
+  notes?: boolean;
 }
 
 export const TYPES: Record<ProjectType, TypeDef> = {
   novel: { label: "Novel", container: "chapter", single: false, containerLabel: "Chapter" },
+  memoir: { label: "Memoir", container: "chapter", single: false, containerLabel: "Chapter" },
   short_story: { label: "Short story", container: null, single: false },
+  personal_essay: { label: "Personal essay", container: null, single: true, notes: true },
+  article: { label: "Article / essay", container: null, single: true, notes: true },
   poem: { label: "Poem", container: null, single: true },
   script: { label: "Movie script", container: "act", single: false, containerLabel: "Act" },
   play: { label: "Play", container: "act", single: false, containerLabel: "Act" },

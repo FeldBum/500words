@@ -292,6 +292,7 @@ async function createProject(db: any, userId: number, type: ProjectType, title: 
   const p = r[0];
   const def = TYPES[type];
   if (def.single) {
+    if (def.notes) await insertNode(db, p.id, null, "overview", "Notes");
     await insertNode(db, p.id, null, "page", "");
   } else {
     await insertNode(db, p.id, null, "overview", "Overview");
@@ -328,6 +329,9 @@ async function convertProject(db: any, user: User, project: any, target: Project
       await db`delete from nodes where id in ${db(others)}`;
     }
     await db`update nodes set kind = 'page', parent_id = null, title = '', position = 1 where id = ${page.id}`;
+    if (def.notes && !nodes.some((n: any) => n.kind === "overview")) {
+      await db`insert into nodes (project_id, parent_id, kind, title, position) values (${project.id}, null, 'overview', 'Notes', 0)`;
+    }
     if (containers.length) await db`delete from nodes where id in ${db(containers.map((c: any) => c.id))}`;
   } else {
     if (!nodes.some((n: any) => n.kind === "overview")) {
@@ -599,6 +603,7 @@ route("POST", "/api/import", true, async ({ req }, user) => {
     const r = await tx`insert into projects (user_id, type, title) values (${user!.id}, ${type}, ${title}) returning *`;
     const proj = r[0];
     if (plan.page !== null) {
+      if (TYPES[type].notes) await insertNode(tx, proj.id, null, "overview", "Notes");
       await insertNode(tx, proj.id, null, "page", "", { body: plan.page });
       return proj;
     }
@@ -777,7 +782,7 @@ route("POST", "/api/projects/:id/nodes", true, async ({ req, params }, user) => 
     let parentId: number | null = null;
     let title = str(b.title, 200, "Title").trim();
     if (kind === "character") {
-      title ||= "New character";
+      title ||= p.type === "memoir" ? "New person" : "New character";
     } else if (kind === "chapter" || kind === "act") {
       if (def.container !== kind) throw bad("That doesn't belong in this kind of project.");
       const n = await tx`select count(*)::int as c from nodes where project_id = ${p.id} and kind = ${kind}`;

@@ -78,6 +78,9 @@ test("new projects get the right structure", async () => {
   expect(await shape("script")).toBe("act,overview,scene");
   expect(await shape("poem")).toBe("page");
   expect(await shape("freeform")).toBe("page");
+  expect(await shape("memoir")).toBe("chapter,overview,scene");
+  expect(await shape("personal_essay")).toBe("overview,page");
+  expect(await shape("article")).toBe("overview,page");
   expect((await c.post("/api/projects", { type: "essay" })).status).toBe(400);
 });
 
@@ -540,4 +543,45 @@ test("sharing one story by link", async () => {
   expect((await stranger.post(`/api/projects/${p.id}/share`, { enabled: true })).status).toBe(404);
   expect((await anon.post(`/api/projects/${p.id}/share`, { enabled: true })).status).toBe(401);
   expect((await anon.get(`/api/shared/not-a-real-token`)).status).toBe(404);
+});
+
+
+test("personal essay: a page plus notes; notes survive converting to a memoir and back", async () => {
+  const c = await user("essayist");
+  const p = (await c.post("/api/projects", { type: "personal_essay", title: "On Leaving" })).data.project;
+  let { nodes } = (await c.get(`/api/projects/${p.id}`)).data;
+  const notes = nodes.find((n: any) => n.kind === "overview");
+  const page = nodes.find((n: any) => n.kind === "page");
+  expect(notes.title).toBe("Notes");
+  await c.put(`/api/nodes/${notes.id}`, { body: "The turn: the train station." });
+  await c.put(`/api/nodes/${page.id}`, { body: "I left on a Tuesday." });
+  expect((await c.post(`/api/projects/${p.id}/nodes`, { kind: "character" })).status).toBe(400);
+  // Only the essay itself is in the manuscript, never the notes.
+  const ms = (await c.get(`/api/projects/${p.id}/manuscript`)).data.parts;
+  expect(ms.map((x: any) => x.body)).toEqual(["I left on a Tuesday."]);
+
+  await c.post(`/api/projects/${p.id}/convert`, { type: "memoir" });
+  ({ nodes } = (await c.get(`/api/projects/${p.id}`)).data);
+  expect(nodes.find((n: any) => n.id === notes.id).kind).toBe("overview");
+  expect(nodes.find((n: any) => n.id === page.id).kind).toBe("scene");
+  expect(nodes.some((n: any) => n.kind === "chapter")).toBe(true);
+
+  await c.post(`/api/projects/${p.id}/convert`, { type: "article" });
+  ({ nodes } = (await c.get(`/api/projects/${p.id}`)).data);
+  expect(nodes.filter((n: any) => n.kind === "overview").length).toBe(1);
+  expect((await c.get(`/api/nodes/${notes.id}`)).data.node.body).toBe("The turn: the train station.");
+
+  // A freeform page turned into an essay gets a fresh notes page.
+  const f = (await c.post("/api/projects", { type: "freeform", title: "F" })).data.project;
+  await c.post(`/api/projects/${f.id}/convert`, { type: "personal_essay" });
+  const fn = (await c.get(`/api/projects/${f.id}`)).data.nodes;
+  expect(fn.map((n: any) => n.kind).sort()).toEqual(["overview", "page"]);
+});
+
+test("importing as a personal essay creates the notes page too", async () => {
+  const c = await user("essay_importer");
+  const r = (await upload(c, "e.txt", "Para one.\n\nPara two.")).data;
+  const made = (await c.post("/api/import", { type: "personal_essay", title: "E", blocks: r.blocks })).data.project;
+  const nodes = (await c.get(`/api/projects/${made.id}`)).data.nodes;
+  expect(nodes.map((n: any) => n.kind).sort()).toEqual(["overview", "page"]);
 });
