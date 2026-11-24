@@ -67,6 +67,18 @@ const MIGRATIONS: string[] = [
     primary key (follower_id, followee_id)
   );
   `,
+  // 2: optional email + password resets
+  `
+  alter table users add column email text;
+  create index users_email on users (lower(email));
+  create table password_resets (
+    token text primary key,
+    user_id int not null references users(id) on delete cascade,
+    expires_at timestamptz not null,
+    used_at timestamptz
+  );
+  create index password_resets_user on password_resets(user_id);
+  `,
 ];
 
 export async function migrate() {

@@ -2,6 +2,11 @@ import { sql, migrate } from "./db";
 import { countWords, dayIn, validTimezone, streaks, DAILY_GOAL } from "./words";
 import { TYPES, isType, containerTitle, type ProjectType } from "./types";
 import { join, normalize } from "node:path";
+import { mailer, resetEmail } from "./mail";
+import { parseDocx, parseText, fetchGoogle, planImport, summarize, suggestType, validateBlocks, ImportError, type Plan } from "./importer";
+
+// Swappable in tests.
+export const deps = { fetch: (...a: Parameters<typeof fetch>) => fetch(...a) };
 
 // ---------------------------------------------------------------------------
 // 500words — a writing room. There is no AI anywhere in this app: no text
@@ -115,6 +120,21 @@ function str(v: unknown, max: number, field: string): string {
 
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
 
+function cleanEmail(v: unknown): string | null {
+  const e = str(v, 254, "Email").trim();
+  if (!e) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw bad("That email address doesn't look right.");
+  return e;
+}
+
+function appUrl(req: Request) {
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
+  const u = new URL(req.url);
+  const host = req.headers.get("x-forwarded-host") || u.host;
+  const proto = req.headers.get("x-forwarded-proto") || u.protocol.replace(":", "");
+  return `${proto}://${host}`;
+}
+
 // ---------- auth ------------------------------------------------------------
 
 interface User {
@@ -123,6 +143,7 @@ interface User {
   display_name: string;
   is_public: boolean;
   timezone: string;
+  email: string | null;
 }
 
 async function currentUser(req: Request): Promise<User | null> {
@@ -130,7 +151,7 @@ async function currentUser(req: Request): Promise<User | null> {
   if (!token) return null;
   const h = await sha256(token);
   const rows = await sql`
-    select u.id, u.username, u.display_name, u.is_public, u.timezone
+    select u.id, u.username, u.display_name, u.is_public, u.timezone, u.email
     from sessions s join users u on u.id = s.user_id
     where s.token = ${h} and s.expires_at > now()`;
   return (rows[0] as User) ?? null;
@@ -145,7 +166,7 @@ async function startSession(userId: number) {
 }
 
 function publicUser(u: User) {
-  return { id: u.id, username: u.username, displayName: u.display_name, isPublic: u.is_public, timezone: u.timezone };
+  return { id: u.id, username: u.username, displayName: u.display_name, isPublic: u.is_public, timezone: u.timezone, email: u.email ?? null };
 }
 
 // ---------- word tracking ---------------------------------------------------
@@ -376,11 +397,12 @@ route("POST", "/api/signup", false, async ({ req, server }) => {
   if (!USERNAME_RE.test(username)) throw bad("Usernames are 3–24 characters: lowercase letters, numbers and underscores.");
   if (password.length < 8) throw bad("Passwords need at least 8 characters.");
   const tz = validTimezone(b.timezone) ? b.timezone : "America/New_York";
+  const email = cleanEmail(b.email);
   const exists = await sql`select 1 from users where username = ${username}`;
   if (exists.length) throw new HttpError(409, "That username is taken.");
   const hash = await Bun.password.hash(password);
-  const r = await sql`insert into users (username, display_name, password_hash, timezone)
-                      values (${username}, ${displayName}, ${hash}, ${tz}) returning id, username, display_name, is_public, timezone`;
+  const r = await sql`insert into users (username, display_name, password_hash, timezone, email)
+                      values (${username}, ${displayName}, ${hash}, ${tz}, ${email}) returning id, username, display_name, is_public, timezone, email`;
   const cookie = await startSession(r[0].id);
   return json({ user: publicUser(r[0] as User) }, 201, { "set-cookie": cookie });
 });
@@ -409,8 +431,9 @@ route("POST", "/api/logout", false, async ({ req }) => {
 });
 
 route("GET", "/api/me", false, async (_c, user) => {
-  if (!user) return json({ user: null });
-  return json({ user: publicUser(user) });
+  const resetEnabled = mailer.enabled();
+  if (!user) return json({ user: null, resetEnabled });
+  return json({ user: publicUser(user), resetEnabled });
 });
 
 route("PUT", "/api/me", true, async ({ req }, user) => {
@@ -419,8 +442,9 @@ route("PUT", "/api/me", true, async ({ req }, user) => {
   const displayName = b.displayName !== undefined ? str(b.displayName, 60, "Name").trim() || u.username : u.display_name;
   const isPublic = b.isPublic !== undefined ? !!b.isPublic : u.is_public;
   const tz = b.timezone !== undefined ? (validTimezone(b.timezone) ? b.timezone : u.timezone) : u.timezone;
-  const r = await sql`update users set display_name = ${displayName}, is_public = ${isPublic}, timezone = ${tz}
-                      where id = ${u.id} returning id, username, display_name, is_public, timezone`;
+  const email = b.email !== undefined ? cleanEmail(b.email) : u.email;
+  const r = await sql`update users set display_name = ${displayName}, is_public = ${isPublic}, timezone = ${tz}, email = ${email}
+                      where id = ${u.id} returning id, username, display_name, is_public, timezone, email`;
   return json({ user: publicUser(r[0] as User) });
 });
 
@@ -445,6 +469,151 @@ route("POST", "/api/me/delete", true, async ({ req }, user) => {
     throw new HttpError(401, "That password isn't right.");
   await sql`delete from users where id = ${user!.id}`;
   return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+});
+
+// ---- password reset
+
+const RESET_MINUTES = 60;
+
+route("POST", "/api/password/forgot", false, async ({ req, server }) => {
+  const b = await body(req);
+  const who = str(b.who, 254, "Username or email").trim().toLowerCase().replace(/^@/, "");
+  if (!who) throw bad("Enter your username or email.");
+  if (!mailer.enabled()) throw new HttpError(503, "Password reset by email isn't switched on yet. Ask the person who invited you for help.");
+  limit("forgot:" + clientIp(req, server), 8, 15 * 60_000);
+  limit("forgot-who:" + who, 3, 15 * 60_000);
+  const users = await sql`select id, username, display_name, email from users
+                          where email is not null and (username = ${who} or lower(email) = ${who}) limit 5`;
+  for (const u of users) {
+    const token = newToken();
+    await sql`insert into password_resets (token, user_id, expires_at)
+              values (${await sha256(token)}, ${u.id}, now() + ${RESET_MINUTES + " minutes"}::interval)`;
+    const link = `${appUrl(req)}/reset?token=${token}`;
+    try {
+      await mailer.send({ to: u.email, ...resetEmail(u.username, u.display_name, link) });
+    } catch (e) {
+      console.error("reset email failed", e);
+      throw new HttpError(502, "We couldn't send the email just now. Please try again in a few minutes.");
+    }
+  }
+  // Same answer whether or not an account matched.
+  return json({ ok: true });
+});
+
+async function findReset(token: string) {
+  if (!token || token.length > 100) return null;
+  const r = await sql`select pr.token, pr.user_id, u.username, u.display_name from password_resets pr join users u on u.id = pr.user_id
+                      where pr.token = ${await sha256(token)} and pr.used_at is null and pr.expires_at > now()`;
+  return r[0] ?? null;
+}
+
+route("GET", "/api/password/reset", false, async ({ url }) => {
+  const r = await findReset(url.searchParams.get("token") || "");
+  if (!r) throw new HttpError(410, "This reset link has expired or was already used. Ask for a new one.");
+  return json({ username: r.username, displayName: r.display_name });
+});
+
+route("POST", "/api/password/reset", false, async ({ req, server }) => {
+  limit("reset:" + clientIp(req, server), 20, 15 * 60_000);
+  const b = await body(req);
+  const password = str(b.password, 200, "Password");
+  if (password.length < 8) throw bad("Passwords need at least 8 characters.");
+  const r = await findReset(str(b.token, 100, "Token"));
+  if (!r) throw new HttpError(410, "This reset link has expired or was already used. Ask for a new one.");
+  const hash = await Bun.password.hash(password);
+  await sql.begin(async (tx) => {
+    await tx`update users set password_hash = ${hash} where id = ${r.user_id}`;
+    await tx`update password_resets set used_at = now() where user_id = ${r.user_id} and used_at is null`;
+    await tx`delete from sessions where user_id = ${r.user_id}`;
+  });
+  const cookie = await startSession(r.user_id);
+  const u = await sql`select id, username, display_name, is_public, timezone, email from users where id = ${r.user_id}`;
+  return json({ user: publicUser(u[0] as User) }, 200, { "set-cookie": cookie });
+});
+
+// ---- import (Word, Google Docs, text)
+
+route("POST", "/api/import/parse", true, async ({ req }) => {
+  const ct = req.headers.get("content-type") || "";
+  let parsed: { blocks: any[]; title: string | null };
+  let fallbackTitle = "Imported";
+  try {
+    if (ct.includes("multipart/form-data")) {
+      const form = await req.formData();
+      const file = form.get("file");
+      if (!(file instanceof Blob)) throw bad("Choose a file to import.");
+      const name = (file as File).name || "Imported";
+      fallbackTitle = name.replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").trim() || "Imported";
+      const lower = name.toLowerCase();
+      if (file.size > 20 * 1024 * 1024) throw bad("That file is too big (20 MB at most).");
+      if (lower.endsWith(".docx")) parsed = await parseDocx(Buffer.from(await file.arrayBuffer()));
+      else if (lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".markdown")) parsed = parseText(await file.text(), !lower.endsWith(".txt"));
+      else if (lower.endsWith(".doc")) throw bad("Old .doc files need to be saved as .docx first (in Word: File → Save As → Word Document).");
+      else throw bad("500words can import .docx, .txt and .md files.");
+    } else {
+      const b = await body(req);
+      const buf = await fetchGoogle(str(b.url, 2000, "Link"), deps.fetch as any);
+      parsed = await parseDocx(buf);
+      fallbackTitle = "Imported from Google Docs";
+    }
+  } catch (e) {
+    if (e instanceof ImportError) throw bad(e.message);
+    throw e;
+  }
+  const words = parsed.blocks.filter((b) => b.t === "p").reduce((a, b) => a + countWords(b.text), 0);
+  if (!words) throw bad("We couldn't find any writing in that document.");
+  const type = suggestType(parsed.blocks as any);
+  return json({
+    title: parsed.title || fallbackTitle,
+    blocks: parsed.blocks,
+    words,
+    suggestedType: type,
+    headings: parsed.blocks.filter((b) => b.t.startsWith("h")).length,
+    breaks: parsed.blocks.filter((b) => b.t === "break").length,
+  });
+});
+
+function planFrom(b: any): { plan: Plan; type: ProjectType } {
+  if (!isType(b.type)) throw bad("Pick a kind of project.");
+  try {
+    return { plan: planImport(b.type, validateBlocks(b.blocks)), type: b.type };
+  } catch (e) {
+    if (e instanceof ImportError) throw bad(e.message);
+    throw e;
+  }
+}
+
+route("POST", "/api/import/preview", true, async ({ req }) => {
+  const { plan } = planFrom(await body(req));
+  return json(summarize(plan));
+});
+
+route("POST", "/api/import", true, async ({ req }, user) => {
+  const b = await body(req);
+  const { plan, type } = planFrom(b);
+  const title = str(b.title, 200, "Title").trim() || "Imported";
+  // Imported text was written before today, so it is stored without a
+  // node_days row: it never counts toward the daily 500.
+  const p = await sql.begin(async (tx) => {
+    const r = await tx`insert into projects (user_id, type, title) values (${user!.id}, ${type}, ${title}) returning *`;
+    const proj = r[0];
+    if (plan.page !== null) {
+      await insertNode(tx, proj.id, null, "page", "", { body: plan.page });
+      return proj;
+    }
+    await insertNode(tx, proj.id, null, "overview", "Overview");
+    if (plan.scenes) {
+      for (const s of plan.scenes) await insertNode(tx, proj.id, null, "scene", s.title.slice(0, 200), { body: s.body });
+    } else {
+      const kind = TYPES[type].container!;
+      for (const c of plan.containers!) {
+        const cn = await insertNode(tx, proj.id, null, kind, c.title.slice(0, 200));
+        for (const s of c.scenes) await insertNode(tx, proj.id, cn.id, "scene", s.title.slice(0, 200), { body: s.body });
+      }
+    }
+    return proj;
+  });
+  return json({ project: { id: p.id, type: p.type, title: p.title } }, 201);
 });
 
 // ---- projects
@@ -773,7 +942,7 @@ if (import.meta.main) {
   setInterval(() => sql`delete from sessions where expires_at < now()`.catch(() => {}), 3600_000);
   Bun.serve({
     port: PORT,
-    maxRequestBodySize: 8 * 1024 * 1024,
+    maxRequestBodySize: 25 * 1024 * 1024,
     fetch: async (req, server) => withSecurity(await handle(req, server)),
   });
   console.log(`500words listening on ${PORT}`);

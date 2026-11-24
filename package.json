@@ -5,5 +5,8 @@
   "scripts": {
     "start": "bun src/server.ts",
     "test": "bun test"
+  },
+  "dependencies": {
+    "mammoth": "^1.13.0"
   }
 }

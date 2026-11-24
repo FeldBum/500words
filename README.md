@@ -18,9 +18,16 @@ browser to switch off its own writing suggestions. Every word is the writer's ow
 - Streaks, calendar, last-7-days chart. Public/private stats; friends by username see
   numbers only, never writing.
 
+- Import: Word (.docx), Google Docs links (doc shared "anyone with the link"; fetched only from
+  Google's export URL), .txt and .md. Headings → chapters/acts and scenes; `* * *` breaks split scenes.
+  Imported words never count toward the daily 500.
+- Password reset by email (optional email on accounts), sent through Resend.
+
 ## Stack
 Bun + Postgres (Bun's built-in SQL client), vanilla JS front end, no third-party scripts.
-Deployed on Railway from this repo (Dockerfile). Needs `DATABASE_URL`.
+Deployed on Railway from this repo (Dockerfile). Variables: `DATABASE_URL`, `APP_URL`
+(https://500words.org, used in reset links), `RESEND_API_KEY` and `MAIL_FROM` for reset email.
+Locally, `MAIL_DEV=log` prints emails to the console instead of sending them.
 
 ## Develop
     DATABASE_URL=postgres://... bun src/server.ts

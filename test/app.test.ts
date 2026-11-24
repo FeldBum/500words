@@ -269,3 +269,156 @@ test("password change and account deletion", async () => {
   expect((await c.post("/api/me/delete", { password: "new password" })).status).toBe(200);
   expect((await new Client().post("/api/login", { username: "leaver", password: "new password" })).status).toBe(401);
 });
+
+// ---------------------------------------------------------------------------
+// Import
+const { mailer } = await import("../src/mail");
+const { deps } = await import("../src/server");
+const fixture = (n: string) => Bun.file(new URL(`./fixtures/${n}`, import.meta.url)).arrayBuffer();
+
+async function upload(c: Client, name: string, data: ArrayBuffer | string) {
+  const form = new FormData();
+  form.append("file", new File([data], name));
+  const res = await handle(new Request("http://localhost/api/import/parse", { method: "POST", headers: { cookie: c.cookie }, body: form }), null);
+  return { status: res.status, data: await res.json() };
+}
+
+test("import a Word novel: headings become chapters and scenes, breaks split scenes", async () => {
+  const c = await user("importer");
+  const r = await upload(c, "The_Lighthouse.docx", await fixture("novel.docx"));
+  expect(r.status).toBe(200);
+  expect(r.data.title).toBe("The Lighthouse Keeper");
+  expect(r.data.suggestedType).toBe("novel");
+  const prev = (await c.post("/api/import/preview", { type: "novel", blocks: r.data.blocks })).data;
+  expect(prev.kind).toBe("containers");
+  expect(prev.containers.map((x: any) => x.title)).toEqual(["Chapter One: The Rock", "Chapter Two"]);
+  expect(prev.containers[0].scenes.map((x: any) => x.title)).toEqual(["Arrival", "The Lamp Room", "Scene 3"]);
+  const before = (await c.get("/api/stats")).data.todayWords;
+  const made = await c.post("/api/import", { type: "novel", title: "The Lighthouse Keeper", blocks: r.data.blocks });
+  expect(made.status).toBe(201);
+  const ms = (await c.get(`/api/projects/${made.data.project.id}/manuscript`)).data.parts;
+  expect(ms[0].body).toContain("forty-one");
+  expect(ms[0].body).toContain("&");
+  expect(ms[3].body).toContain("<late>");
+  expect(ms[3].body).toContain("A line of verse\nand the next line");
+  // Imported words don't count toward today's 500 — but new words added afterward do.
+  expect((await c.get("/api/stats")).data.todayWords).toBe(before);
+  await c.put(`/api/nodes/${ms[0].id}`, { body: ms[0].body + " Five more words right here." });
+  expect((await c.get("/api/stats")).data.todayWords).toBe(before + 5);
+});
+
+test("import as other types, and plain text / markdown", async () => {
+  const c = await user("importer2");
+  const r = (await upload(c, "x.docx", await fixture("novel.docx"))).data;
+  const play = (await c.post("/api/import/preview", { type: "play", blocks: r.blocks })).data;
+  expect(play.containers.length).toBe(2);
+  const story = (await c.post("/api/import/preview", { type: "short_story", blocks: r.blocks })).data;
+  expect(story.scenes.map((s: any) => s.title)).toEqual(["Chapter One: The Rock", "Arrival", "The Lamp Room", "Scene 4", "Chapter Two"]);
+  const page = (await c.post("/api/import/preview", { type: "freeform", blocks: r.blocks })).data;
+  expect(page.kind).toBe("page");
+
+  const plain = (await upload(c, "notes.docx", await fixture("plain.docx"))).data;
+  expect(plain.suggestedType).toBe("freeform");
+  const md = (await upload(c, "draft.md", "# Part One\n\nIt began.\n\n## The Door\n\nShe knocked.\n\n***\n\nNobody came.")).data;
+  expect(md.suggestedType).toBe("novel");
+  const mdPrev = (await c.post("/api/import/preview", { type: "novel", blocks: md.blocks })).data;
+  expect(mdPrev.containers[0].title).toBe("Part One");
+  expect(mdPrev.containers[0].scenes.map((s: any) => s.title)).toEqual(["Scene 1", "The Door", "Scene 3"]);
+  const txt = (await upload(c, "story.txt", "First bit.\n\n* * *\n\nSecond bit.")).data;
+  expect(txt.suggestedType).toBe("short_story");
+  expect((await upload(c, "old.doc", "x")).status).toBe(400);
+  expect((await upload(c, "fake.docx", "not a zip")).status).toBe(400);
+  expect((await upload(c, "empty.txt", "   ")).status).toBe(400);
+});
+
+test("import from a Google Docs link only fetches Google's export URL", async () => {
+  const c = await user("googler");
+  const doc = await fixture("novel.docx");
+  const seen: string[] = [];
+  const real = deps.fetch;
+  deps.fetch = (async (u: any) => {
+    seen.push(String(u));
+    if (String(u).includes("SHAREDdoc")) return new Response(doc, { status: 200 });
+    return new Response("<html>Sign in</html>", { status: 200, headers: { "content-type": "text/html" } });
+  }) as any;
+  try {
+    const ok = await c.post("/api/import/parse", { url: "https://docs.google.com/document/d/SHAREDdoc_aaaaaaaaaaaaaaaa/edit?usp=sharing" });
+    expect(ok.status).toBe(200);
+    expect(ok.data.words).toBeGreaterThan(20);
+    expect(seen[0]).toBe("https://docs.google.com/document/d/SHAREDdoc_aaaaaaaaaaaaaaaa/export?format=docx");
+    const priv = await c.post("/api/import/parse", { url: "https://docs.google.com/document/d/PRIVATEdoc_aaaaaaaaaaaaaa/edit" });
+    expect(priv.status).toBe(400);
+    expect(priv.data.error).toContain("Anyone with the link");
+    const evil = await c.post("/api/import/parse", { url: "http://169.254.169.254/latest/meta-data" });
+    expect(evil.status).toBe(400);
+    expect(seen.length).toBe(2);
+  } finally {
+    deps.fetch = real;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Password reset
+test("password reset by email", async () => {
+  const sent: any[] = [];
+  const realSend = mailer.send, realEnabled = mailer.enabled;
+  process.env.APP_URL = "https://500words.org";
+  mailer.enabled = () => true;
+  mailer.send = async (m: any) => { sent.push(m); };
+  try {
+    const c = new Client();
+    expect((await c.post("/api/signup", { username: "forgetful", password: "first password", email: "Forgetful@Example.com" })).status).toBe(201);
+    expect((await c.post("/api/signup", { username: "bademail", password: "first password", email: "nope" })).status).toBe(400);
+    const me = (await c.get("/api/me")).data;
+    expect(me.user.email).toBe("Forgetful@Example.com");
+    expect(me.resetEnabled).toBe(true);
+
+    // Unknown accounts get the same answer and no email.
+    expect((await new Client().post("/api/password/forgot", { who: "nobody_at_all" })).status).toBe(200);
+    expect(sent.length).toBe(0);
+    // By email, case-insensitive.
+    expect((await new Client().post("/api/password/forgot", { who: "forgetful@example.com" })).status).toBe(200);
+    expect(sent.length).toBe(1);
+    expect(sent[0].to).toBe("Forgetful@Example.com");
+    const link = sent[0].text.match(/https:\/\/500words\.org\/reset\?token=(\S+)/);
+    expect(link).toBeTruthy();
+    const token = link[1];
+
+    const anon = new Client();
+    expect((await anon.get(`/api/password/reset?token=${token}`)).data.username).toBe("forgetful");
+    expect((await anon.post("/api/password/reset", { token, password: "short" })).status).toBe(400);
+    const done = await anon.post("/api/password/reset", { token, password: "brand new password" });
+    expect(done.status).toBe(200);
+    expect((await anon.get("/api/projects")).status).toBe(200);   // signed in
+    expect((await c.get("/api/projects")).status).toBe(401);      // old sessions signed out
+    expect((await anon.post("/api/password/reset", { token, password: "again again" })).status).toBe(410); // single use
+    expect((await new Client().post("/api/login", { username: "forgetful", password: "brand new password" })).status).toBe(200);
+
+    // Expired links don't work.
+    await new Client().post("/api/password/forgot", { who: "forgetful" });
+    const t2 = sent[1].text.match(/token=(\S+)/)[1];
+    await sql`update password_resets set expires_at = now() - interval '1 minute'`;
+    expect((await anon.post("/api/password/reset", { token: t2, password: "whatever123" })).status).toBe(410);
+
+    // Accounts without an email can't be reset (and nothing is sent).
+    await user("no_email_here");
+    await new Client().post("/api/password/forgot", { who: "no_email_here" });
+    expect(sent.length).toBe(2);
+    // Email can be added and removed in settings.
+    const x = new Client();
+    await x.post("/api/login", { username: "forgetful", password: "brand new password" });
+    expect((await x.put("/api/me", { email: "" })).data.user.email).toBeNull();
+  } finally {
+    mailer.send = realSend; mailer.enabled = realEnabled; delete process.env.APP_URL;
+  }
+});
+
+test("reset is refused politely when email isn't configured", async () => {
+  const realEnabled = mailer.enabled;
+  mailer.enabled = () => false;
+  try {
+    const r = await new Client().post("/api/password/forgot", { who: "anyone" });
+    expect(r.status).toBe(503);
+    expect((await new Client().get("/api/me")).data.resetEnabled).toBe(false);
+  } finally { mailer.enabled = realEnabled; }
+});

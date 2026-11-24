@@ -218,6 +218,7 @@
     setFocus(false);
     document.querySelectorAll(".scrim").forEach((s) => s.remove());
     const path = location.pathname;
+    if (path === "/reset") return renderReset();
     if (!state.me) {
       if (path.startsWith("/w/")) store("w5-after", path);
       if (path !== "/") history.replaceState(null, "", "/");
@@ -310,6 +311,7 @@
       const user = h("input", { class: "text", name: "username", autocomplete: "username", autocapitalize: "none", spellcheck: "false", required: true, autofocus: true });
       const pass = h("input", { class: "text", type: "password", name: "password", autocomplete: mode === "login" ? "current-password" : "new-password", required: true });
       const name = h("input", { class: "text", name: "name", autocomplete: "name" });
+      const email = h("input", { class: "text", name: "email", type: "email", autocomplete: "email", autocapitalize: "none", spellcheck: "false" });
       const btn = h("button", { class: "btn primary", type: "submit", style: { width: "100%", marginTop: "6px" } }, mode === "login" ? "Sign in" : "Create my account");
       const form = h("form", { class: "stack", onsubmit: async (e) => {
         e.preventDefault();
@@ -317,7 +319,7 @@
         err.textContent = "";
         try {
           const data = { username: user.value, password: pass.value, timezone: tz() };
-          if (mode === "signup") data.displayName = name.value;
+          if (mode === "signup") { data.displayName = name.value; data.email = email.value; }
           const r = await api("POST", mode === "login" ? "/api/login" : "/api/signup", data);
           state.me = r.user;
           await refreshToday();
@@ -333,8 +335,12 @@
         h("label", { class: "field" }, h("span", null, "Username"), user,
           mode === "signup" ? h("div", { class: "hint" }, "Lowercase letters, numbers and underscores. Friends find you by this.") : null),
         h("label", { class: "field" }, h("span", null, "Password"), pass,
-          mode === "signup" ? h("div", { class: "hint" }, "At least 8 characters. There's no email reset, so keep it somewhere safe.") : null),
-        err, btn);
+          mode === "signup" ? h("div", { class: "hint" }, "At least 8 characters.") : null),
+        mode === "signup" ? h("label", { class: "field" }, h("span", null, "Email ", h("span", { class: "faint" }, "(optional)")), email,
+          h("div", { class: "hint" }, "Only used to reset your password if you forget it. Without one, a lost password can't be recovered.")) : null,
+        err, btn,
+        mode === "login" ? h("div", { style: { textAlign: "center", marginTop: "14px" } },
+          h("button", { type: "button", class: "btn ghost small", onclick: () => forgotPassword(user.value) }, "Forgot your password?")) : null);
       formBox.replaceChildren(form);
       setTimeout(() => (mode === "signup" ? name : user).focus(), 10);
     }
@@ -351,6 +357,187 @@
       ),
       h("div", { class: "right" }, h("div", { class: "auth" }, tabs, formBox)),
     ));
+  }
+
+  // ---------- password reset ----------
+  async function forgotPassword(prefill) {
+    await modal((box, close) => {
+      const who = h("input", { class: "text", value: prefill || "", autocapitalize: "none", spellcheck: "false", autocomplete: "username", autofocus: true });
+      const err = h("div", { class: "error" });
+      const btn = h("button", { class: "btn primary" }, "Send me a link");
+      const form = h("form", { onsubmit: async (e) => {
+        e.preventDefault();
+        err.textContent = "";
+        btn.disabled = true;
+        try {
+          await api("POST", "/api/password/forgot", { who: who.value });
+          form.replaceChildren(
+            h("h2", null, "Check your email"),
+            h("p", { class: "muted" }, "If that account has an email address on file, a link to choose a new password is on its way. It works once, for one hour. Look in spam if it doesn't turn up in a few minutes."),
+            h("div", { class: "actions" }, h("button", { type: "button", class: "btn primary", onclick: () => close(true) }, "OK")));
+        } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
+      } },
+        h("h2", null, "Forgot your password?"),
+        h("p", { class: "muted" }, "Enter your username or the email on your account and we'll send you a link to choose a new one."),
+        h("label", { class: "field" }, h("span", null, "Username or email"), who),
+        err,
+        h("p", { class: "faint", style: { fontSize: "14px" } }, "No email on your account? Then it can't be reset by email — ask the person who invited you."),
+        h("div", { class: "actions" }, h("button", { type: "button", class: "btn ghost", onclick: () => close(null) }, "Cancel"), btn));
+      box.append(form);
+    });
+  }
+
+  async function renderReset() {
+    document.title = "Choose a new password · 500words";
+    const token = new URLSearchParams(location.search).get("token") || "";
+    const card = h("div", { class: "auth" });
+    app.replaceChildren(h("div", { class: "welcome" },
+      h("div", { class: "left" }, h("div", { class: "wordmark" }, h("b", null, "500"), "words"),
+        h("div", { class: "pitch" }, h("h1", null, "Back to the desk."), h("p", null, "Choose a new password and you'll be signed straight in."))),
+      h("div", { class: "right" }, card)));
+    let who;
+    try {
+      who = await api("GET", `/api/password/reset?token=${encodeURIComponent(token)}`);
+    } catch (e) {
+      card.replaceChildren(h("h2", null, "That link has run out"), h("p", { class: "muted" }, e.message),
+        h("button", { class: "btn primary", onclick: () => { history.replaceState(null, "", "/"); render(); } }, "Back to sign in"));
+      return;
+    }
+    const pass = h("input", { class: "text", type: "password", autocomplete: "new-password", autofocus: true });
+    const pass2 = h("input", { class: "text", type: "password", autocomplete: "new-password" });
+    const err = h("div", { class: "error" });
+    const btn = h("button", { class: "btn primary", style: { width: "100%" } }, "Save and sign in");
+    card.replaceChildren(h("form", { class: "stack", onsubmit: async (e) => {
+      e.preventDefault();
+      err.textContent = "";
+      if (pass.value !== pass2.value) { err.textContent = "Those two passwords don't match."; return; }
+      btn.disabled = true;
+      try {
+        const r = await api("POST", "/api/password/reset", { token, password: pass.value });
+        state.me = r.user;
+        await refreshToday();
+        history.replaceState(null, "", "/");
+        toast("Password changed. Welcome back.");
+        render();
+      } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
+    } },
+      h("h2", null, `New password for @${who.username}`),
+      h("label", { class: "field" }, h("span", null, "New password"), pass, h("div", { class: "hint" }, "At least 8 characters.")),
+      h("label", { class: "field" }, h("span", null, "Type it again"), pass2),
+      err, btn));
+    setTimeout(() => pass.focus(), 20);
+  }
+
+  // ---------- import ----------
+  async function importFlow() {
+    const result = await modal((box, close) => {
+      box.style.maxWidth = "640px";
+      let mode = "file";
+      let parsed = null;
+      let type = null;
+      const err = h("div", { class: "error" });
+
+      function step1() {
+        err.textContent = "";
+        const tabs = h("div", { class: "tabs" },
+          h("button", { type: "button", class: mode === "file" ? "on" : "", onclick: () => { mode = "file"; step1(); } }, "Word or text file"),
+          h("button", { type: "button", class: mode === "google" ? "on" : "", onclick: () => { mode = "google"; step1(); } }, "Google Doc"));
+        let body;
+        const busy = h("div", { class: "faint", style: { minHeight: "1.5em", fontSize: "15px" } });
+        const send = async (payload) => {
+          err.textContent = "";
+          busy.textContent = "Reading your document…";
+          try {
+            let res;
+            if (payload instanceof FormData) {
+              const r = await fetch("/api/import/parse", { method: "POST", body: payload, credentials: "same-origin" });
+              res = await r.json().catch(() => ({}));
+              if (!r.ok) throw new Error(res.error || "We couldn't read that file.");
+            } else {
+              res = await api("POST", "/api/import/parse", payload);
+            }
+            parsed = res;
+            type = res.suggestedType;
+            step2();
+          } catch (ex) { err.textContent = ex.message; busy.textContent = ""; }
+        };
+        if (mode === "file") {
+          const input = h("input", { type: "file", accept: ".docx,.txt,.md,.markdown", style: { display: "none" }, onchange: () => { if (input.files[0]) { const f = new FormData(); f.append("file", input.files[0]); send(f); } } });
+          const drop = h("div", { class: "dropzone", tabindex: "0", role: "button",
+            onclick: () => input.click(),
+            onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } },
+            ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); },
+            ondragleave: () => drop.classList.remove("over"),
+            ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); const file = e.dataTransfer.files[0]; if (file) { const f = new FormData(); f.append("file", file); send(f); } } },
+            h("b", null, "Choose a file"), h("span", null, " or drop it here"),
+            h("div", { class: "faint", style: { fontSize: "14px", marginTop: "6px" } }, "Word (.docx), plain text (.txt) or Markdown (.md)"));
+          body = h("div", null, input, drop,
+            h("p", { class: "faint", style: { fontSize: "14px" } }, "From Google Docs you can also use File → Download → Microsoft Word (.docx) and upload that."));
+        } else {
+          const url = h("input", { class: "text", type: "url", placeholder: "https://docs.google.com/document/d/…", autofocus: true });
+          body = h("form", { onsubmit: (e) => { e.preventDefault(); send({ url: url.value }); } },
+            h("label", { class: "field" }, h("span", null, "Link to your Google Doc"), url),
+            h("p", { class: "faint", style: { fontSize: "14px" } }, "The doc needs to be shared as “Anyone with the link can view” (Share → General access) so 500words can read it. You can switch sharing back off once it's imported."),
+            h("button", { class: "btn primary" }, "Read the doc"));
+          setTimeout(() => url.focus(), 20);
+        }
+        box.replaceChildren(h("h2", null, "Import your writing"), tabs, body, busy, err,
+          h("div", { class: "actions" }, h("button", { type: "button", class: "btn ghost", onclick: () => close(null) }, "Cancel")));
+      }
+
+      function step2() {
+        err.textContent = "";
+        const title = noAI(h("input", { class: "text", value: parsed.title, maxlength: 200 }));
+        const opts = h("div", { class: "types" });
+        const preview = h("div", { class: "import-preview" });
+        const go = h("button", { class: "btn primary" }, "Import");
+        const drawTypes = () => opts.replaceChildren(...TYPE_ORDER.map((t) =>
+          h("button", { type: "button", class: "type-opt" + (t === type ? " on" : ""), style: { "--spine": TYPES[t].spine }, onclick: () => { type = t; drawTypes(); drawPreview(); } },
+            h("b", null, TYPES[t].label), h("span", null, TYPES[t].blurb))));
+        let seq = 0;
+        async function drawPreview() {
+          const mine = ++seq;
+          preview.replaceChildren(h("div", { class: "faint" }, "…"));
+          try {
+            const p = await api("POST", "/api/import/preview", { type, blocks: parsed.blocks });
+            if (mine !== seq) return;
+            const def = TYPES[type];
+            const sceneLine = (s, i) => h("li", null, h("span", null, s.title), h("span", { class: "faint" }, s.words ? fmt(s.words) : "empty"));
+            let list;
+            if (p.kind === "page") list = h("p", { class: "muted" }, `One page, ${plural(p.words, "word")}.`);
+            else if (p.kind === "scenes") list = h("ol", null, p.scenes.map(sceneLine));
+            else list = h("div", null, p.containers.map((c) => h("div", { class: "pv-c" }, h("div", { class: "pv-ct" }, c.title), h("ol", null, c.scenes.map(sceneLine)))));
+            const summary = p.kind === "page" ? "" : p.kind === "scenes" ? `${plural(p.scenes.length, "scene")} · ${plural(p.words, "word")}` :
+              `${plural(p.containers.length, def.containerLabel.toLowerCase())} · ${plural(p.containers.reduce((a, c) => a + c.scenes.length, 0), "scene")} · ${plural(p.words, "word")}`;
+            preview.replaceChildren(summary ? h("div", { class: "label", style: { marginBottom: "8px" } }, summary) : null, list);
+          } catch (ex) { preview.replaceChildren(h("div", { class: "error" }, ex.message)); }
+        }
+        drawTypes();
+        drawPreview();
+        go.addEventListener("click", async () => {
+          go.disabled = true;
+          err.textContent = "";
+          try {
+            const r = await api("POST", "/api/import", { type, title: title.value, blocks: parsed.blocks });
+            close(r.project);
+          } catch (ex) { err.textContent = ex.message; go.disabled = false; }
+        });
+        const how = parsed.headings
+          ? "Headings become chapters (or acts) and scenes; * * * breaks start new scenes."
+          : parsed.breaks ? "Scene breaks (* * *) start new scenes." : "No headings or scene breaks were found, so it comes in as one piece.";
+        box.replaceChildren(
+          h("h2", null, "How should it come in?"),
+          h("p", { class: "muted", style: { fontSize: "15px", marginTop: "-6px" } }, `Found ${plural(parsed.words, "word")}. ${how}`),
+          h("label", { class: "field" }, h("span", null, "Title"), title),
+          h("div", { style: { height: "14px" } }), opts,
+          h("div", { class: "label", style: { margin: "18px 0 8px" } }, "Preview"), preview,
+          h("p", { class: "faint", style: { fontSize: "14px" } }, "Imported words are already written, so they don't count toward today's 500. You can rename, reorder or merge scenes afterward."),
+          err,
+          h("div", { class: "actions" }, h("button", { type: "button", class: "btn ghost", onclick: step1 }, "Back"), go));
+      }
+      step1();
+    });
+    if (result) { toast("Imported."); go(`/p/${result.id}`); }
   }
 
   // ---------- desk ----------
@@ -392,7 +579,8 @@
         h("p", null, "Start a novel, a story, a script or a play — or open a freeform page and just write. You can turn a freeform page into anything later."),
         h("div", { class: "row", style: { justifyContent: "center" } },
           h("button", { class: "btn primary", onclick: () => quickFreeform() }, "Open a freeform page"),
-          h("button", { class: "btn", onclick: () => newProject() }, "Start a project")));
+          h("button", { class: "btn", onclick: () => newProject() }, "Start a project"),
+          h("button", { class: "btn", onclick: () => importFlow() }, "Import from Word or Google Docs")));
     } else {
       shelves = h("div", null, TYPE_ORDER.filter((t) => projects.some((p) => p.type === t)).map((t) =>
         h("section", { class: "shelf" },
@@ -410,7 +598,7 @@
       h("div", { class: "desk-head" },
         h("div", null, h("div", { class: "label" }, new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })),
           h("h1", null, `${greet}, ${first}.`)),
-        h("div", { class: "row" }, projects.length ? h("button", { class: "btn", onclick: () => quickFreeform() }, "Freeform page") : null, newBtn)),
+        h("div", { class: "row wrap" }, projects.length ? [h("button", { class: "btn", onclick: () => importFlow() }, "Import"), h("button", { class: "btn", onclick: () => quickFreeform() }, "Freeform page")] : null, newBtn)),
       todayCard,
       shelves));
   }
@@ -1099,13 +1287,14 @@
     document.title = "Settings · 500words";
     const me = state.me;
     const name = h("input", { class: "text", value: me.displayName, maxlength: 60 });
+    const email = h("input", { class: "text", type: "email", value: me.email || "", autocomplete: "email", placeholder: "you@example.com" });
     let zones = [];
     try { zones = Intl.supportedValuesOf("timeZone"); } catch {}
     const tzSel = h("select", { class: "text" }, (zones.length ? zones : [me.timezone]).map((z) => h("option", { value: z, selected: z === me.timezone ? true : null }, z.replace(/_/g, " "))));
     const pub = h("input", { type: "checkbox", checked: me.isPublic });
     const saveProfile = async () => {
       try {
-        const r = await api("PUT", "/api/me", { displayName: name.value, isPublic: pub.checked, timezone: tzSel.value });
+        const r = await api("PUT", "/api/me", { displayName: name.value, isPublic: pub.checked, timezone: tzSel.value, email: email.value });
         state.me = r.user;
         toast("Saved.");
       } catch (e) { toast(e.message, true); }
@@ -1123,6 +1312,8 @@
         h("h2", null, "Profile"),
         h("label", { class: "field" }, h("span", null, "Name"), name),
         h("div", { class: "field" }, h("span", null, "Username"), h("div", null, "@" + me.username)),
+        h("label", { class: "field" }, h("span", null, "Email"), email,
+          h("div", { class: "hint" }, me.email ? "Used only if you need to reset your password." : "Add one so you can reset your password if you ever forget it.")),
         h("label", { class: "field" }, h("span", null, "Time zone"), tzSel, h("div", { class: "hint" }, "Your day — and your 500 — resets at midnight here.")),
         h("button", { class: "btn primary", onclick: saveProfile }, "Save")),
       h("div", { class: "card stack", style: { marginTop: "18px" } },
@@ -1162,6 +1353,7 @@
     try {
       const r = await api("GET", "/api/me");
       state.me = r.user;
+      state.resetEnabled = !!r.resetEnabled;
       if (state.me) {
         // Keep the server's idea of "today" in step with this device.
         const here = tz();

@@ -450,3 +450,20 @@ body.focus .focus-meter { display: block; }
 @media (max-width: 420px) {
   .types { grid-template-columns: 1fr; }
 }
+
+/* import */
+.dropzone {
+  border: 2px dashed var(--rule); border-radius: 12px; padding: 34px 20px; text-align: center; cursor: pointer;
+  background: var(--card); margin-bottom: 12px; transition: border-color .15s, background .15s;
+}
+.dropzone:hover, .dropzone.over, .dropzone:focus { border-color: var(--green); background: var(--green-soft); outline: none; }
+.dropzone b { color: var(--green); font-weight: 500; }
+.import-preview {
+  max-height: 240px; overflow: auto; border: 1px solid var(--rule); border-radius: 10px; padding: 12px 16px;
+  background: var(--card); font-size: 15px; margin-bottom: 12px;
+}
+.import-preview ol { margin: 4px 0 10px; padding-left: 22px; }
+.import-preview li { padding: 2px 0; }
+.import-preview li { display: list-item; }
+.import-preview li > span:last-child { float: right; font-size: 13px; margin-left: 12px; }
+.pv-ct { font-weight: 600; margin-top: 6px; }
