@@ -334,7 +334,7 @@ input.text:focus, select.text:focus, textarea.text:focus { border-color: var(--g
 .index-card .row { justify-content: space-between; margin: 0 -16px; padding: 0 16px 10px; border-bottom: 1px solid rgba(151, 58, 44, .28); }
 .index-card input { border: 0; background: transparent; font-size: 18px; outline: none; flex: 1 1 160px; min-width: 0; width: 0; padding: 0; height: 30px; }
 .index-card .row { flex-wrap: wrap; row-gap: 6px; }
-.index-card .row > .faint:nth-child(3) { margin-left: auto; }
+.index-card .row > .faint:nth-child(4) { margin-left: auto; }
 .index-card textarea {
   width: 100%; border: 0; background: transparent; resize: vertical; outline: none; margin-top: 6px;
   font-size: 15.5px; line-height: 1.55; color: var(--ink-soft); min-height: 48px;
@@ -494,3 +494,26 @@ div.writing b, div.writing strong, .ms-body b { font-weight: 700; }
   .paper-foot { gap: 10px; }
   .paper-foot .btn.small { padding: 5px 8px; }
 }
+
+/* drag to reorder */
+.rail-item { position: relative; }
+.grip {
+  display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 22px; flex: none;
+  color: var(--ink-faint); font-size: 12px; letter-spacing: -3px; line-height: 1; cursor: grab; opacity: 0;
+  touch-action: none; user-select: none; -webkit-user-select: none; transition: opacity .12s; border-radius: 4px;
+}
+.grip:hover { color: var(--ink); background: rgba(127, 110, 90, .12); }
+.rail-item > .grip { position: absolute; left: -6px; top: 50%; transform: translateY(-50%); }
+.rail-item.scene > .grip { left: 6px; }
+.rail-item:hover > .grip, .rail-block:hover > .block-grip, .index-card:hover .grip, .grip:focus { opacity: 1; }
+.rail-block { position: relative; }
+.rail-block > .block-grip { position: absolute; left: -12px; top: 6px; }
+.index-card .grip { margin-left: -8px; }
+@media (hover: none) { .grip { opacity: .55; } }
+.drag-ghost {
+  position: fixed; z-index: 70; pointer-events: none; opacity: .92; margin: 0;
+  background: var(--card); border: 1px solid var(--rule); border-radius: 8px; box-shadow: 0 10px 28px rgba(0, 0, 0, .18);
+}
+.drop-line { position: fixed; z-index: 69; height: 3px; border-radius: 3px; background: var(--green); pointer-events: none; display: none; box-shadow: 0 0 0 2px rgba(47, 91, 76, .15); }
+.dragging { opacity: .35; }
+body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select: none !important; -webkit-user-select: none !important; }

@@ -279,6 +279,79 @@
     setTimeout(() => document.addEventListener("mousedown", off), 0);
   }
 
+  // ---------- drag to reorder (mouse and touch) ----------
+  function grip(onStart, extra = "") {
+    return h("span", {
+      class: "grip " + extra, title: "Drag to move", "aria-hidden": "true",
+      onpointerdown: (e) => { if (e.button !== 0) return; e.preventDefault(); e.stopPropagation(); onStart(e); },
+      onclick: (e) => { e.preventDefault(); e.stopPropagation(); },
+    }, "⋮⋮");
+  }
+  // findTarget(x, y) → { where, line: { left, top, width } } or null.
+  function startDrag(e, { source, findTarget, onDrop, scroller }) {
+    const sx = e.clientX, sy = e.clientY;
+    const rect = source.getBoundingClientRect();
+    let started = false, ghost = null, line = null, target = null, lastY = sy, frame = 0;
+    const begin = () => {
+      started = true;
+      ghost = source.cloneNode(true);
+      ghost.removeAttribute("style");
+      ghost.classList.add("drag-ghost");
+      Object.assign(ghost.style, { width: rect.width + "px", left: rect.left + "px", top: rect.top + "px" });
+      line = h("div", { class: "drop-line" });
+      document.body.append(ghost, line);
+      source.classList.add("dragging");
+      document.body.classList.add("is-dragging");
+      const tick = () => {
+        const edge = 48, speed = 10;
+        if (scroller) {
+          const r = scroller.getBoundingClientRect();
+          if (lastY < r.top + edge) scroller.scrollTop -= speed;
+          else if (lastY > r.bottom - edge) scroller.scrollTop += speed;
+        }
+        if (lastY < edge) window.scrollBy(0, -speed);
+        else if (lastY > window.innerHeight - edge) window.scrollBy(0, speed);
+        frame = requestAnimationFrame(tick);
+      };
+      frame = requestAnimationFrame(tick);
+    };
+    const onMove = (ev) => {
+      if (!started) {
+        if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 5) return;
+        begin();
+      }
+      ev.preventDefault();
+      lastY = ev.clientY;
+      ghost.style.transform = `translate(${ev.clientX - sx}px, ${ev.clientY - sy}px)`;
+      target = findTarget(ev.clientX, ev.clientY);
+      if (target) Object.assign(line.style, { display: "block", left: target.line.left + "px", top: target.line.top - 1 + "px", width: target.line.width + "px" });
+      else line.style.display = "none";
+    };
+    const finish = (cancel) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey, true);
+      cancelAnimationFrame(frame);
+      if (!started) return;
+      ghost.remove(); line.remove();
+      source.classList.remove("dragging");
+      document.body.classList.remove("is-dragging");
+      // The pointerup may turn into a click on whatever is underneath; swallow it.
+      const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+      window.addEventListener("click", swallow, { capture: true, once: true });
+      setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 50);
+      if (!cancel && target) onDrop(target.where);
+    };
+    const onUp = () => finish(false);
+    const onCancel = () => finish(true);
+    const onKey = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); finish(true); } };
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey, true);
+  }
+
   // ---------- routing ----------
   async function go(path, replace = false) {
     if (leaveGuard) { try { await leaveGuard(); } catch {} }
@@ -791,10 +864,73 @@
 
     function railItem(n, cls = "") {
       const isLeaf = n.kind === "scene";
-      return h("button", { class: `rail-item ${cls}${n.id === nodeId ? " on" : ""}`, onclick: () => select(n.id), title: n.summary || n.title, "data-node": n.id },
+      const movable = n.kind === "scene" || n.kind === "character";
+      const el = h("button", { class: `rail-item ${cls}${n.id === nodeId ? " on" : ""}`, onclick: () => select(n.id), title: n.summary || n.title,
+        "data-node": n.id, "data-kind": n.kind, "data-parent": n.parentId ?? "" },
+        movable ? grip((e) => railDrag(e, n, el)) : null,
         isLeaf ? h("span", { class: "dot" + (n.words > 0 ? " full" : "") }) : null,
         h("span", { class: "t" }, n.title || "Untitled"),
         n.words ? h("span", { class: "w" }, fmt(n.words)) : null);
+      return el;
+    }
+
+    // Same-kind siblings, in order.
+    const siblingsOf = (kind, parentId) => (parentId === null ? top(kind) : kids(parentId).filter((k) => k.kind === kind));
+
+    function dropMove(n, where) {
+      const cur = siblingsOf(n.kind, n.parentId).map((x) => x.id).indexOf(n.id);
+      const sameParent = where.parentId === undefined || where.parentId === n.parentId;
+      if (sameParent && where.index === cur) return Promise.resolve(false);
+      return move(n, where).then(() => true);
+    }
+
+    function railDrag(e, n, sourceEl) {
+      const kind = n.kind;
+      const lineAt = (top) => { const rr = rail.getBoundingClientRect(); return { left: rr.left + 10, top, width: rr.width - 20 }; };
+      const rowTarget = (row, x, y) => {
+        const id = Number(row.dataset.node);
+        if (id === n.id) return null;
+        const parent = row.dataset.parent === "" ? null : Number(row.dataset.parent);
+        const r = row.getBoundingClientRect();
+        const before = y < r.top + r.height / 2;
+        const sibs = siblingsOf(kind, parent).filter((s) => s.id !== n.id).map((s) => s.id);
+        const where = { index: sibs.indexOf(id) + (before ? 0 : 1) };
+        if (kind === "scene" && def.container) where.parentId = parent;
+        return { where, line: lineAt(before ? r.top : r.bottom) };
+      };
+      startDrag(e, {
+        source: sourceEl, scroller: rail,
+        onDrop: (where) => dropMove(n, where).catch(() => {}),
+        findTarget: (x, y) => {
+          const el = document.elementFromPoint(x, y);
+          if (!el || !rail.contains(el)) return null;
+          if (kind === "chapter" || kind === "act") {
+            const block = el.closest("[data-block]");
+            if (!block) return null;
+            const bid = Number(block.dataset.block);
+            if (bid === n.id) return null;
+            const r = block.getBoundingClientRect();
+            const before = y < r.top + r.height / 2;
+            const ids = top(kind).filter((c) => c.id !== n.id).map((c) => c.id);
+            return { where: { index: ids.indexOf(bid) + (before ? 0 : 1) }, line: lineAt(before ? r.top : r.bottom) };
+          }
+          const row = el.closest(`[data-kind="${kind}"][data-node]`);
+          if (row) return rowTarget(row, x, y);
+          if (kind === "scene" && def.container) {
+            // Dropped on a chapter heading (goes first) or its "+ Scene" link / a collapsed chapter (goes last).
+            const block = el.closest("[data-block]");
+            if (!block) return null;
+            const cid = Number(block.dataset.block);
+            const count = kids(cid).filter((s) => s.kind === "scene" && s.id !== n.id).length;
+            const onHead = el.closest(".chapter-head");
+            if (onHead && !collapsed.has(cid)) return { where: { parentId: cid, index: 0 }, line: lineAt(onHead.getBoundingClientRect().bottom) };
+            const addBtn = block.querySelector(".add-link");
+            const at = addBtn ? addBtn.getBoundingClientRect().top : block.getBoundingClientRect().bottom;
+            return { where: { parentId: cid, index: count }, line: lineAt(at) };
+          }
+          return null;
+        },
+      });
     }
 
     async function addNode(kind, parentId) {
@@ -835,14 +971,16 @@
             const isC = collapsed.has(c.id);
             const scenes = kids(c.id);
             const words = scenes.reduce((s, n) => s + n.words, 0);
-            const head = h("div", { class: "row", style: { gap: "0" } },
+            const head = h("div", { class: "row chapter-head", style: { gap: "0" } },
               h("button", { class: "iconbtn", style: { padding: "4px" }, title: isC ? "Expand" : "Collapse", onclick: () => { isC ? collapsed.delete(c.id) : collapsed.add(c.id); saveCollapsed(); drawRail(); } },
                 h("span", { class: "twisty" }, icon(ICONS.chev, 14))),
               h("button", { class: `rail-item container${c.id === nodeId ? " on" : ""}`, onclick: () => select(c.id), title: c.summary || c.title },
                 h("span", { class: "t" }, c.title || "Untitled"), words ? h("span", { class: "w" }, fmt(words)) : null));
-            return h("div", { class: isC ? "collapsed" : "" }, head,
-              isC ? null : [scenes.map((s) => railItem(s, "scene")),
-                h("button", { class: "add-link indent", onclick: () => addNode("scene", c.id) }, "+ Scene")]);
+            const block = h("div", { class: "rail-block" + (isC ? " collapsed" : ""), "data-block": c.id });
+            block.append(grip((e) => railDrag(e, c, block), "block-grip"), head,
+              ...(isC ? [] : [...scenes.map((s) => railItem(s, "scene")),
+                h("button", { class: "add-link indent", onclick: () => addNode("scene", c.id) }, "+ Scene")]));
+            return block;
           }));
       } else {
         manuscript = h("div", { class: "rail-group" },
@@ -970,12 +1108,34 @@
         t.addEventListener("input", save);
         sum.addEventListener("input", () => { save(); autosize(sum); });
         setTimeout(() => autosize(sum), 0);
-        return h("div", { class: "index-card" },
-          h("div", { class: "row" }, h("span", { class: "faint", style: { fontSize: "14px", width: "22px" } }, i + 1), t,
+        const card = h("div", { class: "index-card", "data-node": s.id });
+        card.append(
+          h("div", { class: "row" }, grip((e) => cardDrag(e, s, card)), h("span", { class: "faint", style: { fontSize: "14px", width: "22px" } }, i + 1), t,
             h("span", { class: "faint", style: { fontSize: "14px", whiteSpace: "nowrap" } }, s.words ? plural(s.words, "word") : "unwritten"),
             h("button", { class: "btn small", onclick: () => select(s.id) }, s.words ? "Write" : "Start")),
           sum);
+        return card;
       }));
+      function cardDrag(e, s, card) {
+        startDrag(e, {
+          source: card,
+          onDrop: async (where) => {
+            try { if (await dropMove(s, where)) go(location.pathname, true); } catch {}
+          },
+          findTarget: (x, y) => {
+            const el = document.elementFromPoint(x, y);
+            const over = el && el.closest(".index-card[data-node]");
+            if (!over || !cards.contains(over)) return null;
+            const id = Number(over.dataset.node);
+            if (id === s.id) return null;
+            const r = over.getBoundingClientRect();
+            const before = y < r.top + r.height / 2;
+            const ids = scenes.filter((x2) => x2.id !== s.id).map((x2) => x2.id);
+            const gap = 7;
+            return { where: { index: ids.indexOf(id) + (before ? 0 : 1) }, line: { left: r.left, top: before ? r.top - gap : r.bottom + gap, width: r.width } };
+          },
+        });
+      }
 
       pane.replaceChildren(
         h("div", { class: "row mobile-only", style: { marginBottom: "10px" } }, h("button", { class: "btn small", onclick: openRail }, icon(ICONS.menu, 16), "Contents")),
