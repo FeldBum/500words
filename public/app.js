@@ -288,12 +288,17 @@
     }, "⋮⋮");
   }
   // findTarget(x, y) → { where, line: { left, top, width } } or null.
-  function startDrag(e, { source, findTarget, onDrop, scroller }) {
+  // longPress: for touch on a whole row — hold still ~0.35s to pick it up,
+  // so a normal swipe still scrolls.
+  function startDrag(e, { source, findTarget, onDrop, scroller, longPress = false }) {
     const sx = e.clientX, sy = e.clientY;
-    const rect = source.getBoundingClientRect();
-    let started = false, ghost = null, line = null, target = null, lastY = sy, frame = 0;
+    let rect = source.getBoundingClientRect();
+    let started = false, ghost = null, line = null, target = null, lastY = sy, frame = 0, timer = 0;
     const begin = () => {
+      if (started) return;
       started = true;
+      rect = source.getBoundingClientRect();
+      try { navigator.vibrate && navigator.vibrate(10); } catch {}
       ghost = source.cloneNode(true);
       ghost.removeAttribute("style");
       ghost.classList.add("drag-ghost");
@@ -317,7 +322,9 @@
     };
     const onMove = (ev) => {
       if (!started) {
-        if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 5) return;
+        const moved = Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy);
+        if (longPress) { if (moved > 8) finish(true); return; }
+        if (moved < 5) return;
         begin();
       }
       ev.preventDefault();
@@ -327,7 +334,12 @@
       if (target) Object.assign(line.style, { display: "block", left: target.line.left + "px", top: target.line.top - 1 + "px", width: target.line.width + "px" });
       else line.style.display = "none";
     };
+    const onTouchMove = (ev) => { if (started) ev.preventDefault(); };
+    const onContext = (ev) => { if (started || longPress) ev.preventDefault(); };
     const finish = (cancel) => {
+      clearTimeout(timer);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("contextmenu", onContext, true);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
@@ -346,6 +358,9 @@
     const onUp = () => finish(false);
     const onCancel = () => finish(true);
     const onKey = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); finish(true); } };
+    if (longPress) timer = setTimeout(begin, 350);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("contextmenu", onContext, true);
     window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onCancel);
@@ -865,8 +880,9 @@
     function railItem(n, cls = "") {
       const isLeaf = n.kind === "scene";
       const movable = n.kind === "scene" || n.kind === "character";
-      const el = h("button", { class: `rail-item ${cls}${n.id === nodeId ? " on" : ""}`, onclick: () => select(n.id), title: n.summary || n.title,
-        "data-node": n.id, "data-kind": n.kind, "data-parent": n.parentId ?? "" },
+      const el = h("button", { class: `rail-item ${cls}${n.id === nodeId ? " on" : ""}${movable ? " movable" : ""}`, onclick: () => select(n.id), title: n.summary || n.title,
+        "data-node": n.id, "data-kind": n.kind, "data-parent": n.parentId ?? "",
+        onpointerdown: movable ? (e) => rowDown(e, n, el) : null },
         movable ? grip((e) => railDrag(e, n, el)) : null,
         isLeaf ? h("span", { class: "dot" + (n.words > 0 ? " full" : "") }) : null,
         h("span", { class: "t" }, n.title || "Untitled"),
@@ -884,7 +900,13 @@
       return move(n, where).then(() => true);
     }
 
-    function railDrag(e, n, sourceEl) {
+    // Press-and-drag anywhere on a row (mouse), or press-and-hold (touch).
+    function rowDown(e, n, el) {
+      if (e.button !== 0 || e.target.closest(".grip")) return;
+      railDrag(e, n, el, e.pointerType !== "mouse");
+    }
+
+    function railDrag(e, n, sourceEl, longPress = false) {
       const kind = n.kind;
       const lineAt = (top) => { const rr = rail.getBoundingClientRect(); return { left: rr.left + 10, top, width: rr.width - 20 }; };
       const rowTarget = (row, x, y) => {
@@ -899,7 +921,7 @@
         return { where, line: lineAt(before ? r.top : r.bottom) };
       };
       startDrag(e, {
-        source: sourceEl, scroller: rail,
+        source: sourceEl, scroller: rail, longPress,
         onDrop: (where) => dropMove(n, where).catch(() => {}),
         findTarget: (x, y) => {
           const el = document.elementFromPoint(x, y);
@@ -974,7 +996,8 @@
             const head = h("div", { class: "row chapter-head", style: { gap: "0" } },
               h("button", { class: "iconbtn", style: { padding: "4px" }, title: isC ? "Expand" : "Collapse", onclick: () => { isC ? collapsed.delete(c.id) : collapsed.add(c.id); saveCollapsed(); drawRail(); } },
                 h("span", { class: "twisty" }, icon(ICONS.chev, 14))),
-              h("button", { class: `rail-item container${c.id === nodeId ? " on" : ""}`, onclick: () => select(c.id), title: c.summary || c.title },
+              h("button", { class: `rail-item container movable${c.id === nodeId ? " on" : ""}`, onclick: () => select(c.id), title: c.summary || c.title,
+                onpointerdown: (e) => { if (e.button === 0) railDrag(e, c, e.currentTarget.closest(".rail-block"), e.pointerType !== "mouse"); } },
                 h("span", { class: "t" }, c.title || "Untitled"), words ? h("span", { class: "w" }, fmt(words)) : null));
             const block = h("div", { class: "rail-block" + (isC ? " collapsed" : ""), "data-block": c.id });
             block.append(grip((e) => railDrag(e, c, block), "block-grip"), head,

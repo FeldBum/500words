@@ -517,3 +517,6 @@ div.writing b, div.writing strong, .ms-body b { font-weight: 700; }
 .drop-line { position: fixed; z-index: 69; height: 3px; border-radius: 3px; background: var(--green); pointer-events: none; display: none; box-shadow: 0 0 0 2px rgba(47, 91, 76, .15); }
 .dragging { opacity: .35; }
 body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select: none !important; -webkit-user-select: none !important; }
+.rail-item.movable { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.rail-item > .grip, .rail-block > .block-grip { opacity: .35; }
+.rail-item:hover > .grip, .rail-block:hover > .block-grip { opacity: 1; }
